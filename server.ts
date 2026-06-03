@@ -331,16 +331,46 @@ async function handleDeals(req: Request): Promise<Response> {
   if (isNaN(accountId) || accountId <= 0) return jsonResp({ error: "Invalid ctidTraderAccountId" }, 400);
 
   try {
+    // Always refresh the access token first — cTrader tokens expire in ~1h.
+    // Use the refresh_token to get a fresh access_token before opening the WS.
+    let freshAccessToken = String(access_token);
+    let freshRefreshToken = refreshToken;
+    try {
+      const refreshRes = await fetch(`${OAUTH_BASE}/apps/token`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type:    "refresh_token",
+          refresh_token: refreshToken,
+          client_id:     getEnv("CTRADER_CLIENT_ID"),
+          client_secret: getEnv("CTRADER_CLIENT_SECRET"),
+        }),
+      });
+      const refreshData = await refreshRes.json();
+      if (refreshRes.ok && !refreshData.errorCode) {
+        freshAccessToken  = refreshData.accessToken  || refreshData.access_token  || freshAccessToken;
+        freshRefreshToken = refreshData.refreshToken || refreshData.refresh_token || freshRefreshToken;
+        console.log("[deals] pre-flight token refresh succeeded");
+      } else {
+        console.warn("[deals] pre-flight token refresh failed, proceeding with original token:", refreshData);
+      }
+    } catch (e) {
+      console.warn("[deals] pre-flight token refresh threw, proceeding with original token:", e);
+    }
+
     let result: Array<Record<string, unknown>> = [];
-    const tokenRef: { accessToken?: string; refreshToken?: string } = {};
+    const tokenRef: { accessToken?: string; refreshToken?: string } = {
+      accessToken:  freshAccessToken,
+      refreshToken: freshRefreshToken,
+    };
     await withCtraderWS(async (send, nextMsg) => {
       send(PT_APP_AUTH_REQ, { clientId: getEnv("CTRADER_CLIENT_ID"), clientSecret: getEnv("CTRADER_CLIENT_SECRET") }, "app");
       await waitFor(nextMsg, PT_APP_AUTH_RES);
-      send(PT_ACCOUNT_AUTH_REQ, { ctidTraderAccountId: accountId, accessToken: String(access_token) }, "acc");
+      send(PT_ACCOUNT_AUTH_REQ, { ctidTraderAccountId: accountId, accessToken: freshAccessToken }, "acc");
 await waitFor(nextMsg, PT_ACCOUNT_AUTH_RES);
 // kurz warten damit cTrader 2147/2164 Token-Rotation abschließen kann
 await new Promise(r => setTimeout(r, 2000));
-const rawDeals = await fetchDeals(send, nextMsg, accountId, from, to, tokenRef, refreshToken);
+const rawDeals = await fetchDeals(send, nextMsg, accountId, from, to, tokenRef, freshRefreshToken);
       const uniqueIds = [...new Set(rawDeals.map(d => Number(d.symbolId)).filter(Boolean))];
       const symbolMap = await fetchSymbolMap(send, nextMsg, accountId, uniqueIds);
       result = normalizeDeals(rawDeals, symbolMap);

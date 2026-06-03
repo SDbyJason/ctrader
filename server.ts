@@ -161,7 +161,6 @@ async function fetchDeals(
       ctidTraderAccountId: accountId,
       fromTimestamp: chunkFrom,
       toTimestamp: chunkTo,
-    ‏
     }, `dl_${++i}`);
     const res   = await waitFor(nextMsg, PT_DEAL_LIST_RES);
     const payload = (res.payload || {}) as Record<string, unknown>;

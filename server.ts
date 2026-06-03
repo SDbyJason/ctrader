@@ -134,16 +134,14 @@ async function waitFor(nextMsg: NextMsgFn, expectedType: number): Promise<Record
   while (true) {
     const msg = await nextMsg();
     const pt  = msg.payloadType as number;
-    if (pt === PT_ERROR_RES) {
-      const p = (msg.payload || {}) as Record<string, unknown>;
-      throw new Error(`cTrader error [${p.errorCode}]: ${p.description || JSON.stringify(p)}`);
-    }
-    // Also catch payloadType 2142 (OA error response)
-    if (pt === 2142) {
+    if (pt === PT_ERROR_RES || pt === 2142) {
       const p = (msg.payload || {}) as Record<string, unknown>;
       throw new Error(`cTrader error [${p.errorCode}]: ${p.description || JSON.stringify(p)}`);
     }
     if (pt === expectedType) return msg;
+    // 2164 (account disconnect during token rotation) and all other server pushes:
+    // silently skip — the expected response always follows
+    console.log(`[ws] skipping payloadType ${pt} while waiting for ${expectedType}`);
   }
 }
 

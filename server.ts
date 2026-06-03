@@ -51,7 +51,8 @@ type NextMsgFn = () => Promise<Record<string, unknown>>;
 
 async function withCtraderWS(
   fn: (send: SendFn, nextMsg: NextMsgFn) => Promise<void>,
-  accountEnv = "demo"
+  accountEnv = "demo",
+  tokenRef: { accessToken?: string; refreshToken?: string } = {}
 ): Promise<void> {
   const wsUrl = accountEnv === "live" ? WS_LIVE : WS_DEMO;
   console.log(`[ws] connecting to ${wsUrl}`);
@@ -100,9 +101,15 @@ async function withCtraderWS(
         // payloadType 2147 = token rotation event, store new tokens but don't dispatch to waiters
         if (msg.payloadType === 2147) {
           const p = (msg.payload || {}) as Record<string, unknown>;
-          if (p.accessToken)  (ws as unknown as Record<string,unknown>)._newAccessToken  = p.accessToken;
-          if (p.refreshToken) (ws as unknown as Record<string,unknown>)._newRefreshToken = p.refreshToken;
+          if (p.accessToken)  tokenRef.accessToken  = p.accessToken as string;
+          if (p.refreshToken) tokenRef.refreshToken = p.refreshToken as string;
           return;
+        }
+        // payloadType 2174 = deal list response, may also contain new tokens
+        if (msg.payloadType === 2174) {
+          const p = (msg.payload || {}) as Record<string, unknown>;
+          if (p.accessToken)  tokenRef.accessToken  = p.accessToken as string;
+          if (p.refreshToken) tokenRef.refreshToken = p.refreshToken as string;
         }
         if (waiters.length > 0) waiters.shift()!(msg);
         else queue.push(msg);
@@ -292,6 +299,7 @@ async function handleDeals(req: Request): Promise<Response> {
 
   try {
     let result: Array<Record<string, unknown>> = [];
+    const tokenRef: { accessToken?: string; refreshToken?: string } = {};
     await withCtraderWS(async (send, nextMsg) => {
       send(PT_APP_AUTH_REQ, { clientId: getEnv("CTRADER_CLIENT_ID"), clientSecret: getEnv("CTRADER_CLIENT_SECRET") }, "app");
       await waitFor(nextMsg, PT_APP_AUTH_RES);
@@ -302,8 +310,12 @@ async function handleDeals(req: Request): Promise<Response> {
       const symbolMap = await fetchSymbolMap(send, nextMsg, accountId, uniqueIds);
       result = normalizeDeals(rawDeals, symbolMap);
       console.log(`[deals] done: ${result.length} deals`);
-    }, env);
-    return jsonResp({ data: result });
+    }, env, tokenRef);
+    return jsonResp({
+      data: result,
+      newAccessToken:  tokenRef.accessToken  || null,
+      newRefreshToken: tokenRef.refreshToken || null,
+    });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error("[deals] error:", msg);

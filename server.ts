@@ -1,11 +1,14 @@
-/**
+‏/**
  * APEX <-> cTrader Open API Bridge (Deno)
- * Correct endpoints: demo.ctraderapi.com / live.ctraderapi.com
  *
- * ProtoOADealListReq (2173) REQUIRES refreshToken as a mandatory field.
- * When the server sends a token-rotation event (2147) mid-session,
- * the new refreshToken is captured via tokenRef and used for subsequent chunks.
- * payloadType 2164 (account disconnect) is treated as a fatal error.
+ * Token-rotation flow (triggered when refreshToken is sent in ProtoOADealListReq):
+ *   → 2173 (deal list req with refreshToken)
+ *   ← 2147 (token rotation push — new tokens, skip dispatch)
+ *   ← 2164 (account disconnect push — skip, do NOT throw)
+ *   ← 2174 (deal list response — contains new tokens + deals)
+ *
+ * 2164 must be silently skipped inside waitFor, not treated as fatal.
+ * The real 2174 always follows and carries the fresh tokens.
  */
 
 const OAUTH_BASE      = "https://openapi.ctrader.com";
@@ -22,7 +25,6 @@ const PT_DEAL_LIST_RES    = 2174;
 const PT_SYMBOL_BY_ID_REQ = 2121;
 const PT_SYMBOL_BY_ID_RES = 2122;
 const PT_ERROR_RES        = 50;
-const PT_ACCOUNT_DISC     = 2164; // account disconnected — fatal
 
 function getEnv(k: string): string { return Deno.env.get(k) || ""; }
 
@@ -105,16 +107,16 @@ async function withCtraderWS(
         const msg = JSON.parse(data as string) as Record<string, unknown>;
         console.log("[ws] received:", JSON.stringify(msg).substring(0, 300));
 
-        // 2147 = server-push token rotation — capture new tokens, skip dispatch
+        // 2147 = server-push token rotation — capture tokens, do NOT dispatch to waiters
         if (msg.payloadType === 2147) {
           const p = (msg.payload || {}) as Record<string, unknown>;
           if (p.accessToken)  tokenRef.accessToken  = p.accessToken as string;
           if (p.refreshToken) tokenRef.refreshToken = p.refreshToken as string;
-          console.log("[ws] token rotation received (2147), new tokens captured");
-          return; // do NOT forward to waiters
+          console.log("[ws] 2147 token rotation captured");
+          return; // skip dispatch
         }
 
-        // 2174 = deal list response — may also carry rotated tokens
+        // 2174 = deal list response — always carries fresh tokens after rotation
         if (msg.payloadType === PT_DEAL_LIST_RES) {
           const p = (msg.payload || {}) as Record<string, unknown>;
           if (p.accessToken)  tokenRef.accessToken  = p.accessToken as string;
@@ -141,8 +143,13 @@ async function withCtraderWS(
 }
 
 /**
- * Wait for a specific payloadType, skipping unrelated push messages.
- * Throws on protocol errors (50, 2142) and account-disconnect (2164).
+ * Wait for a specific payloadType.
+ *
+ * SKIP silently (do not throw, do not return):
+ *   - 2164 (account disconnect) — always followed by 2174 with fresh tokens
+ *   - any other unsolicited push (heartbeats, etc.)
+ *
+ * THROW on protocol errors: 50, 2142.
  */
 async function waitFor(nextMsg: NextMsgFn, expectedType: number): Promise<Record<string, unknown>> {
   while (true) {
@@ -154,24 +161,17 @@ async function waitFor(nextMsg: NextMsgFn, expectedType: number): Promise<Record
       throw new Error(`cTrader error [${p.errorCode}]: ${p.description || JSON.stringify(p)}`);
     }
 
-    // Account disconnected — signals expired/invalid access token
-    if (pt === PT_ACCOUNT_DISC) {
-      throw new Error("cTrader: account disconnected (2164) — access token expired, re-authenticate");
-    }
-
     if (pt === expectedType) return msg;
 
-    // Unrelated push (e.g. server heartbeat, spot prices) — skip
-    console.log(`[ws] skipping unexpected payloadType ${pt} while waiting for ${expectedType}`);
+    // 2164 and all other unsolicited pushes — skip and keep waiting
+    console.log(`[ws] skipping payloadType ${pt} while waiting for ${expectedType}`);
   }
 }
 
 /**
  * Fetch deals in 7-day chunks.
- *
- * ProtoOADealListReq (2173) requires refreshToken as a mandatory field.
- * tokenRef is a live reference — if a 2147 token-rotation arrives mid-session,
- * tokenRef.refreshToken is updated and subsequent chunks use the fresh token.
+ * refreshToken is a required field in ProtoOADealListReq.
+ * tokenRef is live — after a 2147 rotation the next chunk uses the fresh token.
  */
 async function fetchDeals(
   send: SendFn,
@@ -188,15 +188,13 @@ async function fetchDeals(
 
   while (chunkFrom < to) {
     const chunkTo = Math.min(chunkFrom + MS_7, to);
-
-    // Always use the most current refreshToken (may have been rotated by a 2147 event)
     const currentRefreshToken = tokenRef.refreshToken || initialRefreshToken;
 
     send(PT_DEAL_LIST_REQ, {
       ctidTraderAccountId: accountId,
       fromTimestamp:       chunkFrom,
       toTimestamp:         chunkTo,
-      refreshToken:        currentRefreshToken, // required by cTrader API
+      refreshToken:        currentRefreshToken,
     }, `dl_${++i}`);
 
     const res   = await waitFor(nextMsg, PT_DEAL_LIST_RES);
@@ -343,18 +341,16 @@ async function handleDeals(req: Request): Promise<Response> {
   if (!access_token || !ctidTraderAccountId) return jsonResp({ error: "Missing params" }, 400);
   if (!refresh_token) return jsonResp({ error: "Missing refresh_token" }, 400);
 
-  const accountId          = Number(ctidTraderAccountId);
-  const from               = Number(fromTimestamp || (Date.now() - 7 * 24 * 3600 * 1000));
-  const to                 = Number(toTimestamp   || Date.now());
-  const env                = (accountEnv as string) || "demo";
+  const accountId           = Number(ctidTraderAccountId);
+  const from                = Number(fromTimestamp || (Date.now() - 7 * 24 * 3600 * 1000));
+  const to                  = Number(toTimestamp   || Date.now());
+  const env                 = (accountEnv as string) || "demo";
   const initialRefreshToken = String(refresh_token);
 
   if (isNaN(accountId) || accountId <= 0) return jsonResp({ error: "Invalid ctidTraderAccountId" }, 400);
 
   try {
     let result: Array<Record<string, unknown>> = [];
-    // tokenRef is passed into both withCtraderWS (for 2147/2174 capture)
-    // and fetchDeals (so each chunk uses the latest token after rotation)
     const tokenRef: { accessToken?: string; refreshToken?: string } = {};
 
     await withCtraderWS(async (send, nextMsg) => {
@@ -372,7 +368,8 @@ async function handleDeals(req: Request): Promise<Response> {
       }, "acc");
       await waitFor(nextMsg, PT_ACCOUNT_AUTH_RES);
 
-      // 3. Fetch deals chunk by chunk (refreshToken required by API, rotated tokens auto-used)
+      // 3. Fetch deals (2147 rotation + 2164 disconnect are skipped inside waitFor,
+      //    fresh tokens arrive in 2174 and are stored in tokenRef)
       const rawDeals  = await fetchDeals(send, nextMsg, accountId, from, to, tokenRef, initialRefreshToken);
       const uniqueIds = [...new Set(rawDeals.map(d => Number(d.symbolId)).filter(Boolean))];
       const symbolMap = await fetchSymbolMap(send, nextMsg, accountId, uniqueIds);

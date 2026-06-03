@@ -97,6 +97,13 @@ async function withCtraderWS(
       try {
         const msg = JSON.parse(data as string) as Record<string, unknown>;
         console.log("[ws] received:", JSON.stringify(msg).substring(0, 200));
+        // payloadType 2147 = token rotation event, store new tokens but don't dispatch to waiters
+        if (msg.payloadType === 2147) {
+          const p = (msg.payload || {}) as Record<string, unknown>;
+          if (p.accessToken)  (ws as unknown as Record<string,unknown>)._newAccessToken  = p.accessToken;
+          if (p.refreshToken) (ws as unknown as Record<string,unknown>)._newRefreshToken = p.refreshToken;
+          return;
+        }
         if (waiters.length > 0) waiters.shift()!(msg);
         else queue.push(msg);
       } catch { /* ignore */ }

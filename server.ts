@@ -62,7 +62,6 @@ async function withCtraderWS(
     let closed    = false;
     let closeErr: Error | null = null;
 
-    // Heartbeat every 10s to keep connection alive
     const heartbeat = setInterval(() => {
       if (!closed) {
         try { ws.send(JSON.stringify({ clientMsgId: "hb", payloadType: 51, payload: {} })); }
@@ -72,7 +71,6 @@ async function withCtraderWS(
 
     ws.onopen = async () => {
       console.log("[ws] onopen fired, readyState:", ws.readyState);
-      await new Promise(r => setTimeout(r, 500));
       const send: SendFn = (payloadType, payload, clientMsgId) => {
         const msg = JSON.stringify({ clientMsgId, payloadType, payload });
         console.log("[ws] sending:", msg.substring(0, 200));
@@ -90,7 +88,7 @@ async function withCtraderWS(
           waiters.push((msg) => { clearTimeout(timer); res(msg); });
         });
       };
-     console.log("[ws] starting fn...");
+      console.log("[ws] starting fn...");
       try   { await fn(send, nextMsg); clearInterval(heartbeat); ws.close(); resolve(); }
       catch (e) { clearInterval(heartbeat); ws.close(); reject(e); }
     };
@@ -103,8 +101,7 @@ async function withCtraderWS(
         else queue.push(msg);
       } catch { /* ignore */ }
     };
-    ws.onerror = (e) => {
-      console.error("[ws] error", e);
+    ws.onerror = () => {
       clearInterval(heartbeat);
       closed = true; closeErr = new Error("WebSocket error");
       waiters.forEach(w => w({})); waiters.length = 0;
@@ -127,20 +124,31 @@ async function waitFor(nextMsg: NextMsgFn, expectedType: number): Promise<Record
       const p = (msg.payload || {}) as Record<string, unknown>;
       throw new Error(`cTrader error [${p.errorCode}]: ${p.description || JSON.stringify(p)}`);
     }
+    // Also catch payloadType 2142 (OA error response)
+    if (pt === 2142) {
+      const p = (msg.payload || {}) as Record<string, unknown>;
+      throw new Error(`cTrader error [${p.errorCode}]: ${p.description || JSON.stringify(p)}`);
+    }
     if (pt === expectedType) return msg;
   }
 }
 
 async function fetchDeals(
   send: SendFn, nextMsg: NextMsgFn,
-  accountId: number, from: number, to: number
+  accountId: number, from: number, to: number,
+  refreshToken: string
 ): Promise<Array<Record<string, unknown>>> {
   const MS_7 = 7 * 24 * 60 * 60 * 1000;
   const all: Array<Record<string, unknown>> = [];
   let chunkFrom = from, i = 0;
   while (chunkFrom < to) {
     const chunkTo = Math.min(chunkFrom + MS_7, to);
-    send(PT_DEAL_LIST_REQ, { ctidTraderAccountId: accountId, fromTimestamp: chunkFrom, toTimestamp: chunkTo, refreshToken }, `dl_${++i}`);
+    send(PT_DEAL_LIST_REQ, {
+      ctidTraderAccountId: accountId,
+      fromTimestamp: chunkFrom,
+      toTimestamp: chunkTo,
+      refreshToken,
+    }, `dl_${++i}`);
     const res   = await waitFor(nextMsg, PT_DEAL_LIST_RES);
     const deals = ((res.payload || {}) as Record<string, unknown>).deal as Array<Record<string, unknown>> || [];
     all.push(...deals);
@@ -263,22 +271,26 @@ async function handleAccounts(req: Request): Promise<Response> {
 async function handleDeals(req: Request): Promise<Response> {
   let body: Record<string, unknown>;
   try { body = await req.json(); } catch { return jsonResp({ error: "Invalid JSON" }, 400); }
-  const { access_token, ctidTraderAccountId, fromTimestamp, toTimestamp, accountEnv } = body;
+  const { access_token, refresh_token, ctidTraderAccountId, fromTimestamp, toTimestamp, accountEnv } = body;
   if (!access_token || !ctidTraderAccountId) return jsonResp({ error: "Missing params" }, 400);
-  const accountId = Number(ctidTraderAccountId);
-  const from      = Number(fromTimestamp || (Date.now() - 7 * 24 * 3600 * 1000));
-  const to        = Number(toTimestamp   || Date.now());
-  const env       = (accountEnv as string) || "demo";
+  if (!refresh_token) return jsonResp({ error: "Missing refresh_token" }, 400);
+
+  const accountId    = Number(ctidTraderAccountId);
+  const from         = Number(fromTimestamp || (Date.now() - 7 * 24 * 3600 * 1000));
+  const to           = Number(toTimestamp   || Date.now());
+  const env          = (accountEnv as string) || "demo";
+  const refreshToken = String(refresh_token);
+
   if (isNaN(accountId) || accountId <= 0) return jsonResp({ error: "Invalid ctidTraderAccountId" }, 400);
 
   try {
     let result: Array<Record<string, unknown>> = [];
     await withCtraderWS(async (send, nextMsg) => {
-      const clientId = getEnv("CTRADER_CLIENT_ID"); const clientSecret = getEnv("CTRADER_CLIENT_SECRET"); console.log(`[auth] clientId="${clientId}" secretLen=${clientSecret.length}`); send(PT_APP_AUTH_REQ, { clientId, clientSecret }, "app");
+      send(PT_APP_AUTH_REQ, { clientId: getEnv("CTRADER_CLIENT_ID"), clientSecret: getEnv("CTRADER_CLIENT_SECRET") }, "app");
       await waitFor(nextMsg, PT_APP_AUTH_RES);
       send(PT_ACCOUNT_AUTH_REQ, { ctidTraderAccountId: accountId, accessToken: String(access_token) }, "acc");
       await waitFor(nextMsg, PT_ACCOUNT_AUTH_RES);
-      const rawDeals  = await fetchDeals(send, nextMsg, accountId, from, to);
+      const rawDeals  = await fetchDeals(send, nextMsg, accountId, from, to, refreshToken);
       const uniqueIds = [...new Set(rawDeals.map(d => Number(d.symbolId)).filter(Boolean))];
       const symbolMap = await fetchSymbolMap(send, nextMsg, accountId, uniqueIds);
       result = normalizeDeals(rawDeals, symbolMap);
@@ -313,7 +325,6 @@ async function handler(req: Request): Promise<Response> {
   }
 }
 
-// Wrap Deno.serve to always inject CORS headers on every response
 const PORT = parseInt(getEnv("PORT") || "8000");
 Deno.serve({ port: PORT }, async (req) => {
   if (req.method === "OPTIONS")

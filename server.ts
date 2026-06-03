@@ -88,6 +88,7 @@ async function withCtraderWS(
           waiters.push((msg) => { clearTimeout(timer); res(msg); });
         });
       };
+     console.log("[ws] starting fn...");
       try   { await fn(send, nextMsg); clearInterval(heartbeat); ws.close(); resolve(); }
       catch (e) { clearInterval(heartbeat); ws.close(); reject(e); }
     };

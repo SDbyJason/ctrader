@@ -5,7 +5,7 @@
  * Auth flow (per docs):
  *   1. ProtoOAApplicationAuthReq  (2100) → ProtoOAApplicationAuthRes  (2101)
  *   2. ProtoOAAccountAuthReq      (2102) → ProtoOAAccountAuthRes      (2103)
- *   3. ProtoOADealListReq         (2173) → ProtoOADealListRes         (2174)
+ *   3. ProtoOADealListReq         (2133) → ProtoOADealListRes         (2134)
  *      Fields: ctidTraderAccountId, fromTimestamp, toTimestamp, refreshToken (required despite not in docs)
  *
  * Token refresh (per docs):
@@ -24,12 +24,12 @@ const PT_APP_AUTH_REQ      = 2100;
 const PT_APP_AUTH_RES      = 2101;
 const PT_ACCOUNT_AUTH_REQ  = 2102;
 const PT_ACCOUNT_AUTH_RES  = 2103;
-const PT_REFRESH_TOKEN_REQ = 2112;
-const PT_REFRESH_TOKEN_RES = 2113;
-const PT_DEAL_LIST_REQ     = 2173;
-const PT_DEAL_LIST_RES     = 2174;
-const PT_SYMBOL_BY_ID_REQ  = 2121;
-const PT_SYMBOL_BY_ID_RES  = 2122;
+const PT_REFRESH_TOKEN_REQ = 2173;
+const PT_REFRESH_TOKEN_RES = 2174;
+const PT_DEAL_LIST_REQ     = 2133;
+const PT_DEAL_LIST_RES     = 2134;
+const PT_SYMBOL_BY_ID_REQ  = 2116;
+const PT_SYMBOL_BY_ID_RES  = 2117;
 const PT_ERROR_RES         = 50;   // ProtoErrorRes
 const PT_OA_ERROR_RES      = 2142; // ProtoOAErrorRes
 

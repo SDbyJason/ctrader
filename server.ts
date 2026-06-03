@@ -312,6 +312,7 @@ async function handleDeals(req: Request): Promise<Response> {
   const from         = Number(fromTimestamp || (Date.now() - 7 * 24 * 3600 * 1000));
   const to           = Number(toTimestamp   || Date.now());
   const env          = (accountEnv as string) || "demo";
+  console.log('[debug] accountId:', accountId, 'env:', env, 'from:', new Date(from).toISOString(), 'to:', new Date(to).toISOString());
   const refreshToken = String(refresh_token);
 
   if (isNaN(accountId) || accountId <= 0) return jsonResp({ error: "Invalid ctidTraderAccountId" }, 400);

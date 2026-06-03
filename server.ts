@@ -98,18 +98,18 @@ async function withCtraderWS(
       try {
         const msg = JSON.parse(data as string) as Record<string, unknown>;
         console.log("[ws] received:", JSON.stringify(msg).substring(0, 200));
-        // payloadType 2147 = token rotation event, store new tokens but don't dispatch to waiters
+        // payloadType 2147 = server-side token expiry notification.
+        // The new tokens are NOT in this message — they arrive in the 2174 response.
+        // Just log and skip (do NOT dispatch to waiters — we're still waiting for 2174).
         if (msg.payloadType === 2147) {
-          const p = (msg.payload || {}) as Record<string, unknown>;
-          if (p.accessToken)  tokenRef.accessToken  = p.accessToken as string;
-          if (p.refreshToken) tokenRef.refreshToken = p.refreshToken as string;
+          console.log("[ws] 2147 token-expiry notification received, continuing to wait for 2174");
           return;
         }
-        // payloadType 2174 = deal list response, may also contain new tokens
+        // payloadType 2174 = deal list response — always carries fresh rotated tokens.
         if (msg.payloadType === 2174) {
           const p = (msg.payload || {}) as Record<string, unknown>;
-          if (p.accessToken)  tokenRef.accessToken  = p.accessToken as string;
-          if (p.refreshToken) tokenRef.refreshToken = p.refreshToken as string;
+          if (p.accessToken)  { tokenRef.accessToken  = p.accessToken  as string; }
+          if (p.refreshToken) { tokenRef.refreshToken = p.refreshToken as string; }
         }
         if (waiters.length > 0) waiters.shift()!(msg);
         else queue.push(msg);
@@ -139,7 +139,7 @@ async function waitFor(nextMsg: NextMsgFn, expectedType: number): Promise<Record
       throw new Error(`cTrader error [${p.errorCode}]: ${p.description || JSON.stringify(p)}`);
     }
     if (pt === expectedType) return msg;
-    // 2164 (account disconnect during token rotation) and all other server pushes: skip
+    // Skip known server-push types that arrive during token rotation or account events
     console.log(`[ws] skipping payloadType ${pt} while waiting for ${expectedType}`);
   }
 }
@@ -164,14 +164,21 @@ async function fetchDeals(
       refreshToken: currentRefreshToken,
     }, `dl_${++i}`);
     const res   = await waitFor(nextMsg, PT_DEAL_LIST_RES);
-    const deals = ((res.payload || {}) as Record<string, unknown>).deal as Array<Record<string, unknown>> || [];
+    const payload = (res.payload || {}) as Record<string, unknown>;
+    // cTrader returns deals under the key "deal" (singular), log payload keys for diagnostics
+    const deals = (payload.deal as Array<Record<string, unknown>>) || [];
     all.push(...deals);
-    console.log(`[ws] chunk ${i}: ${deals.length} deals`);
+    console.log(`[ws] chunk ${i}: ${deals.length} deals (payload keys: ${Object.keys(payload).join(', ')})`);
+    if (deals.length > 0) {
+      console.log(`[ws] sample deal keys: ${Object.keys(deals[0]).join(', ')}`);
+    }
 
-    // cTrader rotiert nach jeder Deal-Anfrage mit refreshToken die Tokens.
-    // Den neuen refreshToken für den nächsten Chunk verwenden, sonst CH_ACCESS_TOKEN_INVALID.
-    if (tokenRef.refreshToken && tokenRef.refreshToken !== currentRefreshToken) {
-      console.log(`[ws] token rotated after chunk ${i}, using new refreshToken for next chunk`);
+    // cTrader rotates tokens after every deal-list request that uses a refreshToken.
+    // Always update currentRefreshToken from the response (even if unchanged).
+    if (tokenRef.refreshToken) {
+      if (tokenRef.refreshToken !== currentRefreshToken) {
+        console.log(`[ws] token rotated after chunk ${i}, using new refreshToken for next chunk`);
+      }
       currentRefreshToken = tokenRef.refreshToken;
     }
 
@@ -200,13 +207,17 @@ function normalizeDeals(deals: Array<Record<string, unknown>>, symbolMap: Map<nu
   return deals.map(d => {
     const symbolId   = Number(d.symbolId);
     const symbolName = symbolMap.get(symbolId) || `Symbol#${symbolId}`;
-    const cpd        = d.closePositionDetail as Record<string, unknown> | undefined;
-    if (cpd) {
-      const scale = Math.pow(10, Number(cpd.moneyDigits || d.moneyDigits || 2));
-      d.closePositionDetail = { ...cpd,
-        grossProfit: Number(cpd.grossProfit || 0) / scale,
-        netProfit:   Number(cpd.netProfit   || 0) / scale,
+    // cTrader may use 'closePositionDetail' or 'closePositionDetails' depending on API version
+    const cpdRaw = (d.closePositionDetail || d.closePositionDetails) as Record<string, unknown> | undefined;
+    if (cpdRaw) {
+      const scale = Math.pow(10, Number(cpdRaw.moneyDigits || d.moneyDigits || 2));
+      const normalizedCpd = { ...cpdRaw,
+        grossProfit: Number(cpdRaw.grossProfit || 0) / scale,
+        netProfit:   Number(cpdRaw.netProfit   || 0) / scale,
+        closedVolume: cpdRaw.closedVolume,
       };
+      // Normalize to always use 'closePositionDetail' (singular) downstream
+      return { ...d, closePositionDetail: normalizedCpd, closePositionDetails: undefined, symbolName };
     }
     return { ...d, symbolName };
   });

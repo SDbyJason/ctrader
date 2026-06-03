@@ -154,24 +154,53 @@ async function fetchDeals(
   const all: Array<Record<string, unknown>> = [];
   let chunkFrom = from, i = 0;
   let currentRefreshToken = initialRefreshToken;
+while (chunkFrom < to) {
+  const chunkTo = Math.min(chunkFrom + MS_7, to);
+  send(PT_DEAL_LIST_REQ, {
+    ctidTraderAccountId: accountId,
+    fromTimestamp: chunkFrom,
+    toTimestamp: chunkTo,
+    refreshToken: currentRefreshToken,
+  }, `dl_${++i}`);
+  let res = await waitFor(nextMsg, PT_DEAL_LIST_RES);
+  let payload = (res.payload || {}) as Record<string, unknown>;
 
-  while (chunkFrom < to) {
-    const chunkTo = Math.min(chunkFrom + MS_7, to);
+  // If response only contains token fields (no 'deal' key), it was a token rotation.
+  // Re-authenticate the account and re-send the same chunk.
+  if (!('deal' in payload) && payload.accessToken) {
+    console.log(`[ws] chunk ${i}: token-only response, re-authing account...`);
+    if (payload.accessToken) tokenRef.accessToken = payload.accessToken as string;
+    if (payload.refreshToken) {
+      tokenRef.refreshToken = payload.refreshToken as string;
+      currentRefreshToken = payload.refreshToken as string;
+    }
+    send(PT_ACCOUNT_AUTH_REQ, { ctidTraderAccountId: accountId, accessToken: tokenRef.accessToken }, "acc_reauth");
+    await waitFor(nextMsg, PT_ACCOUNT_AUTH_RES);
+    // Re-send the same chunk with updated token
     send(PT_DEAL_LIST_REQ, {
       ctidTraderAccountId: accountId,
       fromTimestamp: chunkFrom,
       toTimestamp: chunkTo,
       refreshToken: currentRefreshToken,
-    }, `dl_${++i}`);
-    const res   = await waitFor(nextMsg, PT_DEAL_LIST_RES);
-    const payload = (res.payload || {}) as Record<string, unknown>;
-    // cTrader returns deals under the key "deal" (singular), log payload keys for diagnostics
-    const deals = (payload.deal as Array<Record<string, unknown>>) || [];
-    all.push(...deals);
-    console.log(`[ws] chunk ${i}: ${deals.length} deals (payload keys: ${Object.keys(payload).join(', ')})`);
-    if (deals.length > 0) {
-      console.log(`[ws] sample deal keys: ${Object.keys(deals[0]).join(', ')}`);
-    }
+    }, `dl_${i}_retry`);
+    res = await waitFor(nextMsg, PT_DEAL_LIST_RES);
+    payload = (res.payload || {}) as Record<string, unknown>;
+  }
+
+  const deals = (payload.deal as Array<Record<string, unknown>>) || [];
+  all.push(...deals);
+  console.log(`[ws] chunk ${i}: ${deals.length} deals (payload keys: ${Object.keys(payload).join(', ')})`);
+  if (deals.length > 0) {
+    console.log(`[ws] sample deal keys: ${Object.keys(deals[0]).join(', ')}`);
+  }
+
+  if (tokenRef.refreshToken && tokenRef.refreshToken !== currentRefreshToken) {
+    console.log(`[ws] token rotated after chunk ${i}, using new refreshToken for next chunk`);
+    currentRefreshToken = tokenRef.refreshToken;
+  }
+
+  chunkFrom = chunkTo + 1;
+}
 
     // cTrader rotates tokens after every deal-list request that uses a refreshToken.
     // Always update currentRefreshToken from the response (even if unchanged).

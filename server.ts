@@ -2,10 +2,10 @@
  * APEX <-> cTrader Open API Bridge (Deno)
  * Correct endpoints: demo.ctraderapi.com / live.ctraderapi.com
  *
- * FIX (2025-06): refreshToken MUST NOT be sent in PT_DEAL_LIST_REQ (2173).
- * Sending it triggers a cTrader token-rotation event (2147) + account-disconnect
- * (2164), which causes the deal response (2174) to contain 0 deals.
- * The refreshToken is only needed for /api/refresh (HTTP token renewal).
+ * ProtoOADealListReq (2173) REQUIRES refreshToken as a mandatory field.
+ * When the server sends a token-rotation event (2147) mid-session,
+ * the new refreshToken is captured via tokenRef and used for subsequent chunks.
+ * payloadType 2164 (account disconnect) is treated as a fatal error.
  */
 
 const OAUTH_BASE      = "https://openapi.ctrader.com";
@@ -22,7 +22,7 @@ const PT_DEAL_LIST_RES    = 2174;
 const PT_SYMBOL_BY_ID_REQ = 2121;
 const PT_SYMBOL_BY_ID_RES = 2122;
 const PT_ERROR_RES        = 50;
-const PT_ACCOUNT_DISC     = 2164; // account disconnected — treat as fatal
+const PT_ACCOUNT_DISC     = 2164; // account disconnected — fatal
 
 function getEnv(k: string): string { return Deno.env.get(k) || ""; }
 
@@ -80,7 +80,7 @@ async function withCtraderWS(
       console.log("[ws] onopen fired, readyState:", ws.readyState);
       const send: SendFn = (payloadType, payload, clientMsgId) => {
         const msg = JSON.stringify({ clientMsgId, payloadType, payload });
-        console.log("[ws] sending:", msg.substring(0, 200));
+        console.log("[ws] sending:", msg.substring(0, 300));
         ws.send(msg);
       };
       const nextMsg: NextMsgFn = () => {
@@ -103,17 +103,18 @@ async function withCtraderWS(
     ws.onmessage = ({ data }) => {
       try {
         const msg = JSON.parse(data as string) as Record<string, unknown>;
-        console.log("[ws] received:", JSON.stringify(msg).substring(0, 200));
+        console.log("[ws] received:", JSON.stringify(msg).substring(0, 300));
 
-        // 2147 = token rotation push — capture new tokens, do NOT dispatch to waiters
+        // 2147 = server-push token rotation — capture new tokens, skip dispatch
         if (msg.payloadType === 2147) {
           const p = (msg.payload || {}) as Record<string, unknown>;
           if (p.accessToken)  tokenRef.accessToken  = p.accessToken as string;
           if (p.refreshToken) tokenRef.refreshToken = p.refreshToken as string;
-          return;
+          console.log("[ws] token rotation received (2147), new tokens captured");
+          return; // do NOT forward to waiters
         }
 
-        // 2174 = deal list response — may piggy-back rotated tokens
+        // 2174 = deal list response — may also carry rotated tokens
         if (msg.payloadType === PT_DEAL_LIST_RES) {
           const p = (msg.payload || {}) as Record<string, unknown>;
           if (p.accessToken)  tokenRef.accessToken  = p.accessToken as string;
@@ -141,55 +142,67 @@ async function withCtraderWS(
 
 /**
  * Wait for a specific payloadType, skipping unrelated push messages.
- * Throws on error responses (50, 2142) and account-disconnect (2164).
+ * Throws on protocol errors (50, 2142) and account-disconnect (2164).
  */
 async function waitFor(nextMsg: NextMsgFn, expectedType: number): Promise<Record<string, unknown>> {
   while (true) {
     const msg = await nextMsg();
     const pt  = msg.payloadType as number;
 
-    // Protocol error responses
     if (pt === PT_ERROR_RES || pt === 2142) {
       const p = (msg.payload || {}) as Record<string, unknown>;
       throw new Error(`cTrader error [${p.errorCode}]: ${p.description || JSON.stringify(p)}`);
     }
 
-    // Account disconnected — fatal, signals bad/expired token
+    // Account disconnected — signals expired/invalid access token
     if (pt === PT_ACCOUNT_DISC) {
-      throw new Error("cTrader: account disconnected (2164) — access token may be expired, re-authenticate");
+      throw new Error("cTrader: account disconnected (2164) — access token expired, re-authenticate");
     }
 
     if (pt === expectedType) return msg;
 
-    // Any other unsolicited push (heartbeats, etc.) — skip silently
+    // Unrelated push (e.g. server heartbeat, spot prices) — skip
     console.log(`[ws] skipping unexpected payloadType ${pt} while waiting for ${expectedType}`);
   }
 }
 
 /**
  * Fetch deals in 7-day chunks.
- * NOTE: refreshToken must NOT be included in the request payload —
- * it triggers token-rotation (2147) + disconnect (2164) instead of returning deals.
+ *
+ * ProtoOADealListReq (2173) requires refreshToken as a mandatory field.
+ * tokenRef is a live reference — if a 2147 token-rotation arrives mid-session,
+ * tokenRef.refreshToken is updated and subsequent chunks use the fresh token.
  */
 async function fetchDeals(
-  send: SendFn, nextMsg: NextMsgFn,
-  accountId: number, from: number, to: number
+  send: SendFn,
+  nextMsg: NextMsgFn,
+  accountId: number,
+  from: number,
+  to: number,
+  tokenRef: { accessToken?: string; refreshToken?: string },
+  initialRefreshToken: string
 ): Promise<Array<Record<string, unknown>>> {
   const MS_7 = 7 * 24 * 60 * 60 * 1000;
   const all: Array<Record<string, unknown>> = [];
   let chunkFrom = from, i = 0;
+
   while (chunkFrom < to) {
     const chunkTo = Math.min(chunkFrom + MS_7, to);
+
+    // Always use the most current refreshToken (may have been rotated by a 2147 event)
+    const currentRefreshToken = tokenRef.refreshToken || initialRefreshToken;
+
     send(PT_DEAL_LIST_REQ, {
       ctidTraderAccountId: accountId,
-      fromTimestamp: chunkFrom,
-      toTimestamp:   chunkTo,
-      // ← no refreshToken here! sending it causes token-rotation with 0 deals
+      fromTimestamp:       chunkFrom,
+      toTimestamp:         chunkTo,
+      refreshToken:        currentRefreshToken, // required by cTrader API
     }, `dl_${++i}`);
+
     const res   = await waitFor(nextMsg, PT_DEAL_LIST_RES);
     const deals = ((res.payload || {}) as Record<string, unknown>).deal as Array<Record<string, unknown>> || [];
     all.push(...deals);
-    console.log(`[ws] chunk ${i}: ${deals.length} deals, range ${new Date(chunkFrom).toISOString().slice(0,10)} – ${new Date(chunkTo).toISOString().slice(0,10)}`);
+    console.log(`[ws] chunk ${i}: ${deals.length} deals, ${new Date(chunkFrom).toISOString().slice(0,10)} – ${new Date(chunkTo).toISOString().slice(0,10)}`);
     chunkFrom = chunkTo + 1;
   }
   return all;
@@ -211,7 +224,10 @@ async function fetchSymbolMap(
   return map;
 }
 
-function normalizeDeals(deals: Array<Record<string, unknown>>, symbolMap: Map<number, string>): Array<Record<string, unknown>> {
+function normalizeDeals(
+  deals: Array<Record<string, unknown>>,
+  symbolMap: Map<number, string>
+): Array<Record<string, unknown>> {
   return deals.map(d => {
     const symbolId   = Number(d.symbolId);
     const symbolName = symbolMap.get(symbolId) || `Symbol#${symbolId}`;
@@ -236,8 +252,11 @@ function handleOAuthStart(url: URL): Response {
   if (!origin) return new Response("Missing origin", { status: 400 });
   const state  = b64urlEncode({ uid, env, origin, t: Date.now() });
   const params = new URLSearchParams({
-    client_id: getEnv("CTRADER_CLIENT_ID"), redirect_uri: getEnv("CTRADER_REDIRECT_URI"),
-    scope: "trading", response_type: "code", state,
+    client_id:     getEnv("CTRADER_CLIENT_ID"),
+    redirect_uri:  getEnv("CTRADER_REDIRECT_URI"),
+    scope:         "trading",
+    response_type: "code",
+    state,
   });
   return Response.redirect(`${OAUTH_BASE}/apps/auth?${params.toString()}`, 302);
 }
@@ -253,7 +272,8 @@ async function handleOAuthCallback(url: URL): Promise<Response> {
   const tokenRes = await fetch(`${OAUTH_BASE}/apps/token`, {
     method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
-      grant_type: "authorization_code", code,
+      grant_type:    "authorization_code",
+      code,
       redirect_uri:  getEnv("CTRADER_REDIRECT_URI"),
       client_id:     getEnv("CTRADER_CLIENT_ID"),
       client_secret: getEnv("CTRADER_CLIENT_SECRET"),
@@ -263,7 +283,9 @@ async function handleOAuthCallback(url: URL): Promise<Response> {
   if (!tokenRes.ok || tokenData.errorCode)
     return redirectWithHash(origin, { ok: false, error: tokenData.description || "Token exchange failed" });
   return redirectWithHash(origin, {
-    ok: true, uid: parsed?.uid, env: parsed?.env || "demo",
+    ok:           true,
+    uid:          parsed?.uid,
+    env:          parsed?.env || "demo",
     accessToken:  tokenData.accessToken  || tokenData.access_token,
     refreshToken: tokenData.refreshToken || tokenData.refresh_token,
     expiresIn:    tokenData.expiresIn    || tokenData.expires_in,
@@ -272,7 +294,10 @@ async function handleOAuthCallback(url: URL): Promise<Response> {
 
 function redirectWithHash(origin: string, payload: Record<string, unknown>): Response {
   const hash = b64urlEncode({ type: "ctrader-auth", ...payload });
-  return new Response(null, { status: 302, headers: { Location: (origin as string).replace(/\/+$/, "") + "/#ctrader_auth=" + hash } });
+  return new Response(null, {
+    status: 302,
+    headers: { Location: (origin as string).replace(/\/+$/, "") + "/#ctrader_auth=" + hash },
+  });
 }
 
 async function handleRefresh(req: Request): Promise<Response> {
@@ -280,8 +305,12 @@ async function handleRefresh(req: Request): Promise<Response> {
   if (!refresh_token) return jsonResp({ error: "Missing refresh_token" }, 400);
   const res = await fetch(`${OAUTH_BASE}/apps/token`, {
     method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({ grant_type: "refresh_token", refresh_token,
-      client_id: getEnv("CTRADER_CLIENT_ID"), client_secret: getEnv("CTRADER_CLIENT_SECRET") }),
+    body: new URLSearchParams({
+      grant_type:    "refresh_token",
+      refresh_token,
+      client_id:     getEnv("CTRADER_CLIENT_ID"),
+      client_secret: getEnv("CTRADER_CLIENT_SECRET"),
+    }),
   });
   return jsonResp(await res.json(), res.ok ? 200 : 400);
 }
@@ -290,8 +319,10 @@ async function handleAccounts(req: Request): Promise<Response> {
   const { access_token } = await req.json();
   if (!access_token) return jsonResp({ error: "Missing access_token" }, 400);
   const [live, demo] = await Promise.all([
-    fetch(`https://api.spotware.com/connect/tradingaccounts?access_token=${encodeURIComponent(access_token)}`).then(r => r.ok ? r.json() : null).catch(() => null),
-    fetch(`https://demo.spotware.com/connect/tradingaccounts?access_token=${encodeURIComponent(access_token)}`).then(r => r.ok ? r.json() : null).catch(() => null),
+    fetch(`https://api.spotware.com/connect/tradingaccounts?access_token=${encodeURIComponent(access_token)}`)
+      .then(r => r.ok ? r.json() : null).catch(() => null),
+    fetch(`https://demo.spotware.com/connect/tradingaccounts?access_token=${encodeURIComponent(access_token)}`)
+      .then(r => r.ok ? r.json() : null).catch(() => null),
   ]);
   const accounts = []; const seen = new Set();
   for (const result of [live, demo]) {
@@ -312,27 +343,37 @@ async function handleDeals(req: Request): Promise<Response> {
   if (!access_token || !ctidTraderAccountId) return jsonResp({ error: "Missing params" }, 400);
   if (!refresh_token) return jsonResp({ error: "Missing refresh_token" }, 400);
 
-  const accountId = Number(ctidTraderAccountId);
-  const from      = Number(fromTimestamp || (Date.now() - 7 * 24 * 3600 * 1000));
-  const to        = Number(toTimestamp   || Date.now());
-  const env       = (accountEnv as string) || "demo";
+  const accountId          = Number(ctidTraderAccountId);
+  const from               = Number(fromTimestamp || (Date.now() - 7 * 24 * 3600 * 1000));
+  const to                 = Number(toTimestamp   || Date.now());
+  const env                = (accountEnv as string) || "demo";
+  const initialRefreshToken = String(refresh_token);
 
   if (isNaN(accountId) || accountId <= 0) return jsonResp({ error: "Invalid ctidTraderAccountId" }, 400);
 
   try {
     let result: Array<Record<string, unknown>> = [];
+    // tokenRef is passed into both withCtraderWS (for 2147/2174 capture)
+    // and fetchDeals (so each chunk uses the latest token after rotation)
     const tokenRef: { accessToken?: string; refreshToken?: string } = {};
+
     await withCtraderWS(async (send, nextMsg) => {
       // 1. App auth
-      send(PT_APP_AUTH_REQ, { clientId: getEnv("CTRADER_CLIENT_ID"), clientSecret: getEnv("CTRADER_CLIENT_SECRET") }, "app");
+      send(PT_APP_AUTH_REQ, {
+        clientId:     getEnv("CTRADER_CLIENT_ID"),
+        clientSecret: getEnv("CTRADER_CLIENT_SECRET"),
+      }, "app");
       await waitFor(nextMsg, PT_APP_AUTH_RES);
 
       // 2. Account auth
-      send(PT_ACCOUNT_AUTH_REQ, { ctidTraderAccountId: accountId, accessToken: String(access_token) }, "acc");
+      send(PT_ACCOUNT_AUTH_REQ, {
+        ctidTraderAccountId: accountId,
+        accessToken:         String(access_token),
+      }, "acc");
       await waitFor(nextMsg, PT_ACCOUNT_AUTH_RES);
 
-      // 3. Fetch deals — refreshToken intentionally NOT passed here
-      const rawDeals  = await fetchDeals(send, nextMsg, accountId, from, to);
+      // 3. Fetch deals chunk by chunk (refreshToken required by API, rotated tokens auto-used)
+      const rawDeals  = await fetchDeals(send, nextMsg, accountId, from, to, tokenRef, initialRefreshToken);
       const uniqueIds = [...new Set(rawDeals.map(d => Number(d.symbolId)).filter(Boolean))];
       const symbolMap = await fetchSymbolMap(send, nextMsg, accountId, uniqueIds);
       result = normalizeDeals(rawDeals, symbolMap);

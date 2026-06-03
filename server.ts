@@ -147,23 +147,34 @@ async function waitFor(nextMsg: NextMsgFn, expectedType: number): Promise<Record
 async function fetchDeals(
   send: SendFn, nextMsg: NextMsgFn,
   accountId: number, from: number, to: number,
-  refreshToken: string
+  tokenRef: { accessToken?: string; refreshToken?: string },
+  initialRefreshToken: string
 ): Promise<Array<Record<string, unknown>>> {
   const MS_7 = 7 * 24 * 60 * 60 * 1000;
   const all: Array<Record<string, unknown>> = [];
   let chunkFrom = from, i = 0;
+  let currentRefreshToken = initialRefreshToken;
+
   while (chunkFrom < to) {
     const chunkTo = Math.min(chunkFrom + MS_7, to);
     send(PT_DEAL_LIST_REQ, {
       ctidTraderAccountId: accountId,
       fromTimestamp: chunkFrom,
       toTimestamp: chunkTo,
-      refreshToken,
+      refreshToken: currentRefreshToken,
     }, `dl_${++i}`);
     const res   = await waitFor(nextMsg, PT_DEAL_LIST_RES);
     const deals = ((res.payload || {}) as Record<string, unknown>).deal as Array<Record<string, unknown>> || [];
     all.push(...deals);
     console.log(`[ws] chunk ${i}: ${deals.length} deals`);
+
+    // cTrader rotiert nach jeder Deal-Anfrage mit refreshToken die Tokens.
+    // Den neuen refreshToken für den nächsten Chunk verwenden, sonst CH_ACCESS_TOKEN_INVALID.
+    if (tokenRef.refreshToken && tokenRef.refreshToken !== currentRefreshToken) {
+      console.log(`[ws] token rotated after chunk ${i}, using new refreshToken for next chunk`);
+      currentRefreshToken = tokenRef.refreshToken;
+    }
+
     chunkFrom = chunkTo + 1;
   }
   return all;
@@ -302,7 +313,7 @@ async function handleDeals(req: Request): Promise<Response> {
       await waitFor(nextMsg, PT_APP_AUTH_RES);
       send(PT_ACCOUNT_AUTH_REQ, { ctidTraderAccountId: accountId, accessToken: String(access_token) }, "acc");
       await waitFor(nextMsg, PT_ACCOUNT_AUTH_RES);
-      const rawDeals  = await fetchDeals(send, nextMsg, accountId, from, to, refreshToken);
+      const rawDeals  = await fetchDeals(send, nextMsg, accountId, from, to, tokenRef, refreshToken);
       const uniqueIds = [...new Set(rawDeals.map(d => Number(d.symbolId)).filter(Boolean))];
       const symbolMap = await fetchSymbolMap(send, nextMsg, accountId, uniqueIds);
       result = normalizeDeals(rawDeals, symbolMap);

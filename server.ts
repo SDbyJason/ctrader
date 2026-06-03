@@ -1,6 +1,11 @@
 /**
  * APEX <-> cTrader Open API Bridge (Deno)
  * Correct endpoints: demo.ctraderapi.com / live.ctraderapi.com
+ *
+ * FIX (2025-06): refreshToken MUST NOT be sent in PT_DEAL_LIST_REQ (2173).
+ * Sending it triggers a cTrader token-rotation event (2147) + account-disconnect
+ * (2164), which causes the deal response (2174) to contain 0 deals.
+ * The refreshToken is only needed for /api/refresh (HTTP token renewal).
  */
 
 const OAUTH_BASE      = "https://openapi.ctrader.com";
@@ -17,6 +22,7 @@ const PT_DEAL_LIST_RES    = 2174;
 const PT_SYMBOL_BY_ID_REQ = 2121;
 const PT_SYMBOL_BY_ID_RES = 2122;
 const PT_ERROR_RES        = 50;
+const PT_ACCOUNT_DISC     = 2164; // account disconnected — treat as fatal
 
 function getEnv(k: string): string { return Deno.env.get(k) || ""; }
 
@@ -98,19 +104,22 @@ async function withCtraderWS(
       try {
         const msg = JSON.parse(data as string) as Record<string, unknown>;
         console.log("[ws] received:", JSON.stringify(msg).substring(0, 200));
-        // payloadType 2147 = token rotation event, store new tokens but don't dispatch to waiters
+
+        // 2147 = token rotation push — capture new tokens, do NOT dispatch to waiters
         if (msg.payloadType === 2147) {
           const p = (msg.payload || {}) as Record<string, unknown>;
           if (p.accessToken)  tokenRef.accessToken  = p.accessToken as string;
           if (p.refreshToken) tokenRef.refreshToken = p.refreshToken as string;
           return;
         }
-        // payloadType 2174 = deal list response, may also contain new tokens
-        if (msg.payloadType === 2174) {
+
+        // 2174 = deal list response — may piggy-back rotated tokens
+        if (msg.payloadType === PT_DEAL_LIST_RES) {
           const p = (msg.payload || {}) as Record<string, unknown>;
           if (p.accessToken)  tokenRef.accessToken  = p.accessToken as string;
           if (p.refreshToken) tokenRef.refreshToken = p.refreshToken as string;
         }
+
         if (waiters.length > 0) waiters.shift()!(msg);
         else queue.push(msg);
       } catch { /* ignore */ }
@@ -130,27 +139,41 @@ async function withCtraderWS(
   });
 }
 
+/**
+ * Wait for a specific payloadType, skipping unrelated push messages.
+ * Throws on error responses (50, 2142) and account-disconnect (2164).
+ */
 async function waitFor(nextMsg: NextMsgFn, expectedType: number): Promise<Record<string, unknown>> {
   while (true) {
     const msg = await nextMsg();
     const pt  = msg.payloadType as number;
-    if (pt === PT_ERROR_RES) {
+
+    // Protocol error responses
+    if (pt === PT_ERROR_RES || pt === 2142) {
       const p = (msg.payload || {}) as Record<string, unknown>;
       throw new Error(`cTrader error [${p.errorCode}]: ${p.description || JSON.stringify(p)}`);
     }
-    // Also catch payloadType 2142 (OA error response)
-    if (pt === 2142) {
-      const p = (msg.payload || {}) as Record<string, unknown>;
-      throw new Error(`cTrader error [${p.errorCode}]: ${p.description || JSON.stringify(p)}`);
+
+    // Account disconnected — fatal, signals bad/expired token
+    if (pt === PT_ACCOUNT_DISC) {
+      throw new Error("cTrader: account disconnected (2164) — access token may be expired, re-authenticate");
     }
+
     if (pt === expectedType) return msg;
+
+    // Any other unsolicited push (heartbeats, etc.) — skip silently
+    console.log(`[ws] skipping unexpected payloadType ${pt} while waiting for ${expectedType}`);
   }
 }
 
+/**
+ * Fetch deals in 7-day chunks.
+ * NOTE: refreshToken must NOT be included in the request payload —
+ * it triggers token-rotation (2147) + disconnect (2164) instead of returning deals.
+ */
 async function fetchDeals(
   send: SendFn, nextMsg: NextMsgFn,
-  accountId: number, from: number, to: number,
-  refreshToken: string
+  accountId: number, from: number, to: number
 ): Promise<Array<Record<string, unknown>>> {
   const MS_7 = 7 * 24 * 60 * 60 * 1000;
   const all: Array<Record<string, unknown>> = [];
@@ -160,14 +183,13 @@ async function fetchDeals(
     send(PT_DEAL_LIST_REQ, {
       ctidTraderAccountId: accountId,
       fromTimestamp: chunkFrom,
-      toTimestamp: chunkTo,
-      refreshToken,
+      toTimestamp:   chunkTo,
+      // ← no refreshToken here! sending it causes token-rotation with 0 deals
     }, `dl_${++i}`);
     const res   = await waitFor(nextMsg, PT_DEAL_LIST_RES);
     const deals = ((res.payload || {}) as Record<string, unknown>).deal as Array<Record<string, unknown>> || [];
     all.push(...deals);
-    console.log(`[ws] chunk ${i}: ${deals.length} deals, payload keys: ${Object.keys((res.payload || {}) as Record<string,unknown>).join(',')}`);
-    if (deals.length === 0) console.log(`[ws] full payload: ${JSON.stringify(res.payload).substring(0, 500)}`);
+    console.log(`[ws] chunk ${i}: ${deals.length} deals, range ${new Date(chunkFrom).toISOString().slice(0,10)} – ${new Date(chunkTo).toISOString().slice(0,10)}`);
     chunkFrom = chunkTo + 1;
   }
   return all;
@@ -290,11 +312,10 @@ async function handleDeals(req: Request): Promise<Response> {
   if (!access_token || !ctidTraderAccountId) return jsonResp({ error: "Missing params" }, 400);
   if (!refresh_token) return jsonResp({ error: "Missing refresh_token" }, 400);
 
-  const accountId    = Number(ctidTraderAccountId);
-  const from         = Number(fromTimestamp || (Date.now() - 7 * 24 * 3600 * 1000));
-  const to           = Number(toTimestamp   || Date.now());
-  const env          = (accountEnv as string) || "demo";
-  const refreshToken = String(refresh_token);
+  const accountId = Number(ctidTraderAccountId);
+  const from      = Number(fromTimestamp || (Date.now() - 7 * 24 * 3600 * 1000));
+  const to        = Number(toTimestamp   || Date.now());
+  const env       = (accountEnv as string) || "demo";
 
   if (isNaN(accountId) || accountId <= 0) return jsonResp({ error: "Invalid ctidTraderAccountId" }, 400);
 
@@ -302,18 +323,24 @@ async function handleDeals(req: Request): Promise<Response> {
     let result: Array<Record<string, unknown>> = [];
     const tokenRef: { accessToken?: string; refreshToken?: string } = {};
     await withCtraderWS(async (send, nextMsg) => {
+      // 1. App auth
       send(PT_APP_AUTH_REQ, { clientId: getEnv("CTRADER_CLIENT_ID"), clientSecret: getEnv("CTRADER_CLIENT_SECRET") }, "app");
       await waitFor(nextMsg, PT_APP_AUTH_RES);
+
+      // 2. Account auth
       send(PT_ACCOUNT_AUTH_REQ, { ctidTraderAccountId: accountId, accessToken: String(access_token) }, "acc");
       await waitFor(nextMsg, PT_ACCOUNT_AUTH_RES);
-      const rawDeals  = await fetchDeals(send, nextMsg, accountId, from, to, refreshToken);
+
+      // 3. Fetch deals — refreshToken intentionally NOT passed here
+      const rawDeals  = await fetchDeals(send, nextMsg, accountId, from, to);
       const uniqueIds = [...new Set(rawDeals.map(d => Number(d.symbolId)).filter(Boolean))];
       const symbolMap = await fetchSymbolMap(send, nextMsg, accountId, uniqueIds);
       result = normalizeDeals(rawDeals, symbolMap);
       console.log(`[deals] done: ${result.length} deals`);
     }, env, tokenRef);
+
     return jsonResp({
-      data: result,
+      data:            result,
       newAccessToken:  tokenRef.accessToken  || null,
       newRefreshToken: tokenRef.refreshToken || null,
     });

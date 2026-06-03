@@ -6,7 +6,7 @@
  *   1. ProtoOAApplicationAuthReq  (2100) → ProtoOAApplicationAuthRes  (2101)
  *   2. ProtoOAAccountAuthReq      (2102) → ProtoOAAccountAuthRes      (2103)
  *   3. ProtoOADealListReq         (2173) → ProtoOADealListRes         (2174)
- *      Fields: ctidTraderAccountId, fromTimestamp, toTimestamp, maxRows  — NO refreshToken
+ *      Fields: ctidTraderAccountId, fromTimestamp, toTimestamp, refreshToken (required despite not in docs)
  *
  * Token refresh (per docs):
  *   - Access token expires after 2,628,000 seconds (~30 days)
@@ -196,7 +196,8 @@ async function fetchDeals(
   accountId: number, from: number, to: number,
   tokenRef: TokenRef
 ): Promise<Array<Record<string, unknown>>> {
-  // Per docs: DealListReq max range = 604800000ms (7 days)
+  // cTrader requires refreshToken in every DealListReq despite not being in the public docs.
+  // The server rotates tokens on each response — always use the latest one.
   const MS_7 = 7 * 24 * 60 * 60 * 1000;
   const all: Array<Record<string, unknown>> = [];
   let chunkFrom = from;
@@ -206,19 +207,23 @@ async function fetchDeals(
     chunkNum++;
     const chunkTo = Math.min(chunkFrom + MS_7, to);
 
-    // ProtoOADealListReq — fields per docs: ctidTraderAccountId, fromTimestamp, toTimestamp, maxRows
     send(PT_DEAL_LIST_REQ, {
       ctidTraderAccountId: accountId,
       fromTimestamp:       chunkFrom,
       toTimestamp:         chunkTo,
+      refreshToken:        tokenRef.refreshToken,
     }, `dl_${chunkNum}`);
 
     const res     = await waitFor(nextMsg, PT_DEAL_LIST_RES);
     const payload = (res.payload || {}) as Record<string, unknown>;
-    const deals   = (payload.deal as Array<Record<string, unknown>>) || [];
 
+    // cTrader rotates tokens on every DealListRes — capture the new ones
+    if (payload.accessToken)  tokenRef.accessToken  = payload.accessToken  as string;
+    if (payload.refreshToken) tokenRef.refreshToken = payload.refreshToken as string;
+
+    const deals = (payload.deal as Array<Record<string, unknown>>) || [];
     all.push(...deals);
-    console.log(`[ws] chunk ${chunkNum} [${new Date(chunkFrom).toISOString()} → ${new Date(chunkTo).toISOString()}]: ${deals.length} deals`);
+    console.log(`[ws] chunk ${chunkNum} [${new Date(chunkFrom).toISOString().slice(0,10)} → ${new Date(chunkTo).toISOString().slice(0,10)}]: ${deals.length} deals`);
 
     chunkFrom = chunkTo + 1;
   }

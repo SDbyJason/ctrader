@@ -268,7 +268,7 @@ async function handleDeals(req: Request): Promise<Response> {
   try {
     let result: Array<Record<string, unknown>> = [];
     await withCtraderWS(async (send, nextMsg) => {
-      send(PT_APP_AUTH_REQ, { clientId: getEnv("CTRADER_CLIENT_ID"), clientSecret: getEnv("CTRADER_CLIENT_SECRET") }, "app");
+      const clientId = getEnv("CTRADER_CLIENT_ID"); const clientSecret = getEnv("CTRADER_CLIENT_SECRET"); console.log(`[auth] clientId="${clientId}" secretLen=${clientSecret.length}`); send(PT_APP_AUTH_REQ, { clientId, clientSecret }, "app");
       await waitFor(nextMsg, PT_APP_AUTH_RES);
       send(PT_ACCOUNT_AUTH_REQ, { ctidTraderAccountId: accountId, accessToken: String(access_token) }, "acc");
       await waitFor(nextMsg, PT_ACCOUNT_AUTH_RES);

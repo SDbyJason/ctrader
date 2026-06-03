@@ -226,6 +226,9 @@ async function fetchDeals(
     console.log(`[ws] chunk ${chunkNum} [${new Date(chunkFrom).toISOString().slice(0,10)} → ${new Date(chunkTo).toISOString().slice(0,10)}]: ${deals.length} deals`);
 
     chunkFrom = chunkTo + 1;
+
+    // Rate limit: cTrader allows ~1 req/sec for historical data requests
+    if (chunkFrom < to) await new Promise(r => setTimeout(r, 1000));
   }
 
   return all;

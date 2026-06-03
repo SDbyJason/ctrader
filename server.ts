@@ -139,8 +139,7 @@ async function waitFor(nextMsg: NextMsgFn, expectedType: number): Promise<Record
       throw new Error(`cTrader error [${p.errorCode}]: ${p.description || JSON.stringify(p)}`);
     }
     if (pt === expectedType) return msg;
-    // 2164 (account disconnect during token rotation) and all other server pushes:
-    // silently skip — the expected response always follows
+    // 2164 (account disconnect during token rotation) and all other server pushes: skip
     console.log(`[ws] skipping payloadType ${pt} while waiting for ${expectedType}`);
   }
 }

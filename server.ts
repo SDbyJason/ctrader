@@ -166,7 +166,8 @@ async function fetchDeals(
     const res   = await waitFor(nextMsg, PT_DEAL_LIST_RES);
     const deals = ((res.payload || {}) as Record<string, unknown>).deal as Array<Record<string, unknown>> || [];
     all.push(...deals);
-    console.log(`[ws] chunk ${i}: ${deals.length} deals`);
+    console.log(`[ws] chunk ${i}: ${deals.length} deals, payload keys: ${Object.keys((res.payload || {}) as Record<string,unknown>).join(',')}`);
+    if (deals.length === 0) console.log(`[ws] full payload: ${JSON.stringify(res.payload).substring(0, 500)}`);
     chunkFrom = chunkTo + 1;
   }
   return all;

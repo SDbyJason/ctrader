@@ -324,8 +324,10 @@ async function handleDeals(req: Request): Promise<Response> {
       send(PT_APP_AUTH_REQ, { clientId: getEnv("CTRADER_CLIENT_ID"), clientSecret: getEnv("CTRADER_CLIENT_SECRET") }, "app");
       await waitFor(nextMsg, PT_APP_AUTH_RES);
       send(PT_ACCOUNT_AUTH_REQ, { ctidTraderAccountId: accountId, accessToken: String(access_token) }, "acc");
-      await waitFor(nextMsg, PT_ACCOUNT_AUTH_RES);
-      const rawDeals  = await fetchDeals(send, nextMsg, accountId, from, to, tokenRef, refreshToken);
+await waitFor(nextMsg, PT_ACCOUNT_AUTH_RES);
+// kurz warten damit cTrader 2147/2164 Token-Rotation abschließen kann
+await new Promise(r => setTimeout(r, 2000));
+const rawDeals = await fetchDeals(send, nextMsg, accountId, from, to, tokenRef, refreshToken);
       const uniqueIds = [...new Set(rawDeals.map(d => Number(d.symbolId)).filter(Boolean))];
       const symbolMap = await fetchSymbolMap(send, nextMsg, accountId, uniqueIds);
       result = normalizeDeals(rawDeals, symbolMap);

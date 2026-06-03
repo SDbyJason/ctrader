@@ -74,7 +74,9 @@ async function withCtraderWS(
       console.log("[ws] onopen fired, readyState:", ws.readyState);
       await new Promise(r => setTimeout(r, 500));
       const send: SendFn = (payloadType, payload, clientMsgId) => {
-        ws.send(JSON.stringify({ clientMsgId, payloadType, payload }));
+        const msg = JSON.stringify({ clientMsgId, payloadType, payload });
+        console.log("[ws] sending:", msg.substring(0, 200));
+        ws.send(msg);
       };
       const nextMsg: NextMsgFn = () => {
         if (queue.length > 0) return Promise.resolve(queue.shift()!);

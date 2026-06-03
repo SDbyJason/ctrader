@@ -98,6 +98,7 @@ async function withCtraderWS(
     ws.onmessage = ({ data }) => {
       try {
         const msg = JSON.parse(data as string) as Record<string, unknown>;
+        console.log("[ws] received:", JSON.stringify(msg).substring(0, 200));
         if (waiters.length > 0) waiters.shift()!(msg);
         else queue.push(msg);
       } catch { /* ignore */ }

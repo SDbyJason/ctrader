@@ -140,7 +140,7 @@ async function fetchDeals(
   let chunkFrom = from, i = 0;
   while (chunkFrom < to) {
     const chunkTo = Math.min(chunkFrom + MS_7, to);
-    send(PT_DEAL_LIST_REQ, { ctidTraderAccountId: accountId, fromTimestamp: chunkFrom, toTimestamp: chunkTo }, `dl_${++i}`);
+    send(PT_DEAL_LIST_REQ, { ctidTraderAccountId: accountId, fromTimestamp: chunkFrom, toTimestamp: chunkTo, refreshToken }, `dl_${++i}`);
     const res   = await waitFor(nextMsg, PT_DEAL_LIST_RES);
     const deals = ((res.payload || {}) as Record<string, unknown>).deal as Array<Record<string, unknown>> || [];
     all.push(...deals);

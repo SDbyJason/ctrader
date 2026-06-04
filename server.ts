@@ -3,15 +3,15 @@
  * Built strictly per https://help.ctrader.com/open-api/
  *
  * Auth flow (per docs):
- *   1. ProtoOAApplicationAuthReq  (2100) → ProtoOAApplicationAuthRes  (2101)
- *   2. ProtoOAAccountAuthReq      (2102) → ProtoOAAccountAuthRes      (2103)
- *   3. ProtoOADealListReq         (2133) → ProtoOADealListRes         (2134)
- *      Fields: ctidTraderAccountId, fromTimestamp, toTimestamp, refreshToken (required despite not in docs)
+ * 1. ProtoOAApplicationAuthReq  (2100) → ProtoOAApplicationAuthRes  (2101)
+ * 2. ProtoOAAccountAuthReq      (2102) → ProtoOAAccountAuthRes      (2103)
+ * 3. ProtoOADealListReq         (2133) → ProtoOADealListRes         (2134)
+ * Fields: ctidTraderAccountId, fromTimestamp, toTimestamp, refreshToken (required despite not in docs)
  *
  * Token refresh (per docs):
- *   - Access token expires after 2,628,000 seconds (~30 days)
- *   - Refresh via HTTP POST to /apps/token with grant_type=refresh_token
- *   - OR via ProtoOARefreshTokenReq (2112) → ProtoOARefreshTokenRes (2113)
+ * - Access token expires after 2,628,000 seconds (~30 days)
+ * - Refresh via HTTP POST to /apps/token with grant_type=refresh_token
+ * - OR via ProtoOARefreshTokenReq (2173) → ProtoOARefreshTokenRes (2174)
  */
 
 const OAUTH_BASE      = "https://openapi.ctrader.com";
@@ -44,6 +44,7 @@ function corsHeaders(): Record<string, string> {
     "Access-Control-Max-Age":       "86400",
   };
 }
+
 function jsonResp(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {
     status, headers: { "Content-Type": "application/json", ...corsHeaders() },
@@ -55,6 +56,7 @@ function b64urlEncode(obj: unknown): string {
   let bin = ""; for (const b of bytes) bin += String.fromCharCode(b);
   return btoa(bin).replace(/=+$/, "").replace(/\+/g, "-").replace(/\//g, "_");
 }
+
 function b64urlDecode(s: string): Record<string, unknown> {
   const bin = atob(s.replace(/-/g, "+").replace(/_/g, "/"));
   const bytes = new Uint8Array([...bin].map(c => c.charCodeAt(0)));
@@ -121,8 +123,6 @@ async function withCtraderWS(
         console.log("[ws] ←", JSON.stringify(msg).substring(0, 300));
 
         // 2147 = ProtoOAAccountsTokenInvalidatedEvent — server push, not a response
-        // Per docs: "sent when a session to a specific trader's account is terminated"
-        // Do NOT forward to waiters — we are still waiting for the actual response
         if (msg.payloadType === 2147) {
           console.log("[ws] token-invalidated event received (2147), ignoring");
           return;
@@ -196,8 +196,6 @@ async function fetchDeals(
   accountId: number, from: number, to: number,
   tokenRef: TokenRef
 ): Promise<Array<Record<string, unknown>>> {
-  // cTrader requires refreshToken in every DealListReq despite not being in the public docs.
-  // The server rotates tokens on each response — always use the latest one.
   const MS_7 = 7 * 24 * 60 * 60 * 1000;
   const all: Array<Record<string, unknown>> = [];
   let chunkFrom = from;
@@ -246,20 +244,16 @@ async function fetchSymbolMap(
   const res     = await waitFor(nextMsg, PT_SYMBOL_BY_ID_RES);
   const symbols = (((res.payload || {}) as Record<string, unknown>).symbol || []) as Array<Record<string, unknown>>;
   for (const s of symbols) {
-    // cTrader API returns symbol name in different fields depending on version/endpoint.
-    // ProtoOALightSymbol  → symbolName (top-level)
-    // ProtoOASymbol       → symbolName (top-level) or symbol.symbolName nested
-    // Some brokers wrap it in tradeData.symbolName or tradeData.name
     const nested  = (s.symbol   || {}) as Record<string, unknown>;
     const td      = (s.tradeData || s.TradeData || nested.tradeData || {}) as Record<string, unknown>;
     const name = (
-      s.symbolName          ||   // most common — ProtoOALightSymbol / ProtoOASymbol
-      nested.symbolName     ||   // nested symbol object
-      s.symbolFullName      ||   // full name fallback
+      s.symbolName          ||   
+      nested.symbolName     ||   
+      s.symbolFullName      ||   
       nested.symbolFullName ||
-      td?.symbolName        ||   // tradeData variants
+      td?.symbolName        ||   
       td?.name              ||
-      s.name                     // last resort
+      s.name                     
     ) as string | undefined;
     console.log(`[sym] id=${s.symbolId} name=${name} keys=${Object.keys(s).join(",")} nestedKeys=${Object.keys(nested).join(",")}`);
     if (s.symbolId != null && name) map.set(Number(s.symbolId), name);
@@ -295,7 +289,7 @@ function normalizeDeals(
 
 async function httpRefreshToken(refreshToken: string): Promise<{ accessToken: string; refreshToken: string } | null> {
   try {
-    const res  = await fetch(`${OAUTH_BASE}/apps/token`, {
+    const res = await fetch(`${OAUTH_BASE}/apps/token`, {
       method:  "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body:    new URLSearchParams({
@@ -348,7 +342,8 @@ async function handleOAuthCallback(url: URL): Promise<Response> {
   if (state) { try { parsed = b64urlDecode(state); } catch { /* ignore */ } }
   const origin = (parsed && typeof parsed.origin === "string") ? parsed.origin : FALLBACK_ORIGIN;
   if (errParam || !code) return redirectWithHash(origin, { ok: false, error: errParam || "Missing code" });
-  const tokenRes  = await fetch(`${OAUTH_BASE}/apps/token`, {
+  
+  const tokenRes = await fetch(`${OAUTH_BASE}/apps/token`, {
     method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
       grant_type:    "authorization_code", code,
@@ -360,6 +355,7 @@ async function handleOAuthCallback(url: URL): Promise<Response> {
   const tokenData = await tokenRes.json();
   if (!tokenRes.ok || tokenData.errorCode)
     return redirectWithHash(origin, { ok: false, error: tokenData.description || "Token exchange failed" });
+  
   return redirectWithHash(origin, {
     ok: true, uid: parsed?.uid, env: parsed?.env || "demo",
     accessToken:  tokenData.accessToken  || tokenData.access_token,
@@ -426,7 +422,6 @@ async function handleDeals(req: Request): Promise<Response> {
 
   console.log(`[deals] accountId:${accountId} env:${env} from:${new Date(from).toISOString()} to:${new Date(to).toISOString()}`);
 
-  // Sanity check: reject clearly wrong timestamps (future or before year 2000)
   const now = Date.now();
   if (from > now || to > now + 60_000) {
     console.error(`[deals] timestamp sanity fail: from=${new Date(from).toISOString()} to=${new Date(to).toISOString()}`);
@@ -442,7 +437,7 @@ async function handleDeals(req: Request): Promise<Response> {
     let result: Array<Record<string, unknown>> = [];
 
     await withCtraderWS(async (send, nextMsg) => {
-      // Step 1: Authenticate application (ProtoOAApplicationAuthReq)
+      // Step 1: Authenticate application
       send(PT_APP_AUTH_REQ, {
         clientId:     getEnv("CTRADER_CLIENT_ID"),
         clientSecret: getEnv("CTRADER_CLIENT_SECRET"),
@@ -450,7 +445,7 @@ async function handleDeals(req: Request): Promise<Response> {
       await waitFor(nextMsg, PT_APP_AUTH_RES);
       console.log("[ws] app authenticated");
 
-      // Step 2: Authenticate account (ProtoOAAccountAuthReq)
+      // Step 2: Authenticate account
       send(PT_ACCOUNT_AUTH_REQ, {
         ctidTraderAccountId: accountId,
         accessToken:         tokenRef.accessToken,
@@ -462,13 +457,12 @@ async function handleDeals(req: Request): Promise<Response> {
         console.log("[ws] account authenticated:", accAuthRes);
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
-        // If account auth fails with invalid token, try refreshing first
         if (msg.includes("ACCESS_TOKEN") || msg.includes("INVALID")) {
           console.warn("[ws] account auth failed, refreshing token via WS...");
           const refreshed = await refreshTokenViaWS(send, nextMsg, tokenRef.refreshToken);
           tokenRef.accessToken  = refreshed.accessToken;
           tokenRef.refreshToken = refreshed.refreshToken;
-          // Retry account auth with fresh token
+          
           send(PT_ACCOUNT_AUTH_REQ, {
             ctidTraderAccountId: accountId,
             accessToken:         tokenRef.accessToken,
@@ -480,7 +474,7 @@ async function handleDeals(req: Request): Promise<Response> {
         }
       }
 
-      // Step 3: Fetch deals in 7-day chunks (ProtoOADealListReq)
+      // Step 3: Fetch deals in 7-day chunks
       const rawDeals = await fetchDeals(send, nextMsg, accountId, from, to, tokenRef);
       console.log(`[ws] total raw deals: ${rawDeals.length}`);
 

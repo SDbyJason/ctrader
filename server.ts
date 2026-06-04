@@ -246,9 +246,22 @@ async function fetchSymbolMap(
   const res     = await waitFor(nextMsg, PT_SYMBOL_BY_ID_RES);
   const symbols = (((res.payload || {}) as Record<string, unknown>).symbol || []) as Array<Record<string, unknown>>;
   for (const s of symbols) {
-    const td = (s.tradeData || s.TradeData) as Record<string, unknown> | undefined;
-    const name = (s.symbolName || td?.symbolName || td?.name || s.name) as string | undefined;
-    console.log(`[sym] id=${s.symbolId} name=${name} keys=${Object.keys(s).join(",")}`);
+    // cTrader API returns symbol name in different fields depending on version/endpoint.
+    // ProtoOALightSymbol  → symbolName (top-level)
+    // ProtoOASymbol       → symbolName (top-level) or symbol.symbolName nested
+    // Some brokers wrap it in tradeData.symbolName or tradeData.name
+    const nested  = (s.symbol   || {}) as Record<string, unknown>;
+    const td      = (s.tradeData || s.TradeData || nested.tradeData || {}) as Record<string, unknown>;
+    const name = (
+      s.symbolName          ||   // most common — ProtoOALightSymbol / ProtoOASymbol
+      nested.symbolName     ||   // nested symbol object
+      s.symbolFullName      ||   // full name fallback
+      nested.symbolFullName ||
+      td?.symbolName        ||   // tradeData variants
+      td?.name              ||
+      s.name                     // last resort
+    ) as string | undefined;
+    console.log(`[sym] id=${s.symbolId} name=${name} keys=${Object.keys(s).join(",")} nestedKeys=${Object.keys(nested).join(",")}`);
     if (s.symbolId != null && name) map.set(Number(s.symbolId), name);
   }
   return map;

@@ -35,6 +35,12 @@ const PT_POSITION_LIST_RES   = 2120; // ProtoOAPositionListRes
 const PT_ERROR_RES           = 50;   // ProtoErrorRes
 const PT_OA_ERROR_RES        = 2142; // ProtoOAErrorRes
 
+// Server-push events — never forwarded to waiters (filtered in onmessage):
+// 2147 = ProtoOAAccountsTokenInvalidatedEvent
+// 2164 = ProtoOATraderUpdatedEvent
+// 2206 = ProtoOASymbolsForConversionReq  (internal cTrader use, UNSUPPORTED)
+// 2207 = ProtoOASymbolsForConversionRes  (sent spontaneously after SymbolsListReq)
+
 function getEnv(k: string): string { return Deno.env.get(k) || ""; }
 
 function corsHeaders(): Record<string, string> {
@@ -133,6 +139,16 @@ async function withCtraderWS(
         // 2164 = ProtoOATraderUpdatedEvent — server push, ignore
         if (msg.payloadType === 2164) {
           console.log("[ws] trader-updated event received (2164), ignoring");
+          return;
+        }
+
+        // 2206 = ProtoOASymbolsForConversionReq (internal cTrader message, unsupported)
+        // 2207 = ProtoOASymbolsForConversionRes — cTrader sends this spontaneously after
+        //        a SymbolsListReq; it is a server-push, NOT a response to our request.
+        //        Forwarding it to waiters would corrupt the response sequence for
+        //        subsequent requests (e.g. PositionListReq). Always discard.
+        if (msg.payloadType === 2206 || msg.payloadType === 2207) {
+          console.log(`[ws] SymbolsForConversion push (${msg.payloadType}) ignored`);
           return;
         }
 

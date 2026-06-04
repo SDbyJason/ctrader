@@ -222,6 +222,9 @@ async function fetchDeals(
     if (payload.refreshToken) tokenRef.refreshToken = payload.refreshToken as string;
 
     const deals = (payload.deal as Array<Record<string, unknown>>) || [];
+    if (deals.length > 0 && all.length === 0) {
+      console.log('[ws] SAMPLE DEAL (first):', JSON.stringify(deals[0], null, 2));
+    }
     all.push(...deals);
     console.log(`[ws] chunk ${chunkNum} [${new Date(chunkFrom).toISOString().slice(0,10)} → ${new Date(chunkTo).toISOString().slice(0,10)}]: ${deals.length} deals`);
 
@@ -245,8 +248,10 @@ async function fetchSymbolMap(
   send(PT_SYMBOL_BY_ID_REQ, { ctidTraderAccountId: accountId, symbolId: symbolIds }, "sym_by_id");
   const res     = await waitFor(nextMsg, PT_SYMBOL_BY_ID_RES);
   const symbols = (((res.payload || {}) as Record<string, unknown>).symbol || []) as Array<Record<string, unknown>>;
+  console.log("[ws] SYMBOL RESPONSE sample:", JSON.stringify(symbols[0] || {}, null, 2));
   for (const s of symbols) {
     const name = (s.symbolName || (s.tradeData as Record<string, unknown>)?.symbolName) as string | undefined;
+    console.log("[ws] symbol map:", s.symbolId, "->", name, "| keys:", Object.keys(s).join(", "));
     if (s.symbolId != null && name) map.set(Number(s.symbolId), name);
   }
   return map;

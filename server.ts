@@ -26,12 +26,14 @@ const PT_ACCOUNT_AUTH_REQ  = 2102;
 const PT_ACCOUNT_AUTH_RES  = 2103;
 const PT_REFRESH_TOKEN_REQ = 2173;
 const PT_REFRESH_TOKEN_RES = 2174;
-const PT_DEAL_LIST_REQ     = 2133;
-const PT_DEAL_LIST_RES     = 2134;
-const PT_SYMBOL_BY_ID_REQ  = 2116;
-const PT_SYMBOL_BY_ID_RES  = 2117;
-const PT_ERROR_RES         = 50;   // ProtoErrorRes
-const PT_OA_ERROR_RES      = 2142; // ProtoOAErrorRes
+const PT_DEAL_LIST_REQ       = 2133;
+const PT_DEAL_LIST_RES       = 2134;
+const PT_SYMBOLS_LIST_REQ    = 2115; // ProtoOASymbolsListReq — returns all symbols WITH names
+const PT_SYMBOLS_LIST_RES    = 2116; // ProtoOASymbolsListRes
+const PT_POSITION_LIST_REQ   = 2119; // ProtoOAPositionListReq — returns open positions with SL/TP
+const PT_POSITION_LIST_RES   = 2120; // ProtoOAPositionListRes
+const PT_ERROR_RES           = 50;   // ProtoErrorRes
+const PT_OA_ERROR_RES        = 2142; // ProtoOAErrorRes
 
 function getEnv(k: string): string { return Deno.env.get(k) || ""; }
 
@@ -235,6 +237,8 @@ async function fetchDeals(
 }
 
 // ─── SYMBOL MAP ────────────────────────────────────────────────
+// Uses ProtoOASymbolsListReq (2115) which returns ProtoOALightSymbol[] with symbolName.
+// ProtoOASymbolByIdReq returns ProtoOASymbol which omits symbolName — known cTrader quirk.
 
 async function fetchSymbolMap(
   send: SendFn, nextMsg: NextMsgFn,
@@ -242,28 +246,53 @@ async function fetchSymbolMap(
 ): Promise<Map<number, string>> {
   const map = new Map<number, string>();
   if (symbolIds.length === 0) return map;
-  send(PT_SYMBOL_BY_ID_REQ, { ctidTraderAccountId: accountId, symbolId: symbolIds }, "sym_by_id");
-  const res     = await waitFor(nextMsg, PT_SYMBOL_BY_ID_RES);
-  const symbols = (((res.payload || {}) as Record<string, unknown>).symbol || []) as Array<Record<string, unknown>>;
+
+  // ProtoOASymbolsListReq returns the full broker symbol list as ProtoOALightSymbol[],
+  // every entry has symbolName. SymbolByIdReq returns ProtoOASymbol which lacks symbolName.
+  send(PT_SYMBOLS_LIST_REQ, { ctidTraderAccountId: accountId }, "sym_list");
+  const res     = await waitFor(nextMsg, PT_SYMBOLS_LIST_RES);
+  const payload = (res.payload || {}) as Record<string, unknown>;
+  const symbols = (payload.symbol || []) as Array<Record<string, unknown>>;
+
+  const needed = new Set(symbolIds);
   for (const s of symbols) {
-    // cTrader API returns symbol name in different fields depending on version/endpoint.
-    // ProtoOALightSymbol  → symbolName (top-level)
-    // ProtoOASymbol       → symbolName (top-level) or symbol.symbolName nested
-    // Some brokers wrap it in tradeData.symbolName or tradeData.name
-    const nested  = (s.symbol   || {}) as Record<string, unknown>;
-    const td      = (s.tradeData || s.TradeData || nested.tradeData || {}) as Record<string, unknown>;
-    const name = (
-      s.symbolName          ||   // most common — ProtoOALightSymbol / ProtoOASymbol
-      nested.symbolName     ||   // nested symbol object
-      s.symbolFullName      ||   // full name fallback
-      nested.symbolFullName ||
-      td?.symbolName        ||   // tradeData variants
-      td?.name              ||
-      s.name                     // last resort
-    ) as string | undefined;
-    console.log(`[sym] id=${s.symbolId} name=${name} keys=${Object.keys(s).join(",")} nestedKeys=${Object.keys(nested).join(",")}`);
-    if (s.symbolId != null && name) map.set(Number(s.symbolId), name);
+    const id = Number(s.symbolId);
+    if (!needed.has(id)) continue;
+    const name = (s.symbolName || s.symbolFullName || s.name) as string | undefined;
+    console.log(`[sym] id=${id} name=${name} keys=${Object.keys(s).join(",")}`);
+    if (name) map.set(id, name);
   }
+
+  for (const id of needed) {
+    if (!map.has(id)) console.warn(`[sym] no name found for symbolId=${id}`);
+  }
+
+  return map;
+}
+
+// ─── POSITION MAP (SL/TP) ──────────────────────────────────────
+// cTrader deals do not carry SL/TP — that data lives on the position.
+// We fetch ProtoOAPositionListRes and key it by positionId so normalizeDeals can merge it in.
+
+async function fetchPositionMap(
+  send: SendFn, nextMsg: NextMsgFn,
+  accountId: number
+): Promise<Map<number, { stopLoss?: number; takeProfit?: number }>> {
+  const map = new Map<number, { stopLoss?: number; takeProfit?: number }>();
+  send(PT_POSITION_LIST_REQ, { ctidTraderAccountId: accountId }, "pos_list");
+  const res      = await waitFor(nextMsg, PT_POSITION_LIST_RES);
+  const payload  = (res.payload || {}) as Record<string, unknown>;
+  const positions = (payload.position || []) as Array<Record<string, unknown>>;
+  for (const p of positions) {
+    const id = Number(p.positionId);
+    if (!id) continue;
+    const td = (p.tradeData || {}) as Record<string, unknown>;
+    map.set(id, {
+      stopLoss:   td.stopLoss   != null ? Number(td.stopLoss)   : undefined,
+      takeProfit: td.takeProfit != null ? Number(td.takeProfit) : undefined,
+    });
+  }
+  console.log(`[pos] loaded ${map.size} positions for SL/TP lookup`);
   return map;
 }
 
@@ -271,12 +300,20 @@ async function fetchSymbolMap(
 
 function normalizeDeals(
   deals: Array<Record<string, unknown>>,
-  symbolMap: Map<number, string>
+  symbolMap: Map<number, string>,
+  positionMap: Map<number, { stopLoss?: number; takeProfit?: number }>
 ): Array<Record<string, unknown>> {
   return deals.map(d => {
     const symbolId   = Number(d.symbolId);
+    const positionId = Number(d.positionId);
     const symbolName = symbolMap.get(symbolId) || `Symbol#${symbolId}`;
-    const cpdRaw     = (d.closePositionDetail || d.closePositionDetails) as Record<string, unknown> | undefined;
+    const posMeta    = positionMap.get(positionId) || {};
+
+    // SL/TP: prefer values already on the deal, fall back to position data
+    const stopLoss   = d.stopLoss   ?? posMeta.stopLoss   ?? null;
+    const takeProfit = d.takeProfit ?? posMeta.takeProfit ?? null;
+
+    const cpdRaw = (d.closePositionDetail || d.closePositionDetails) as Record<string, unknown> | undefined;
     if (cpdRaw) {
       const scale = Math.pow(10, Number(cpdRaw.moneyDigits || d.moneyDigits || 2));
       const cpd   = {
@@ -285,9 +322,9 @@ function normalizeDeals(
         netProfit:    Number(cpdRaw.netProfit    || 0) / scale,
         closedVolume: cpdRaw.closedVolume,
       };
-      return { ...d, closePositionDetail: cpd, closePositionDetails: undefined, symbolName };
+      return { ...d, closePositionDetail: cpd, closePositionDetails: undefined, symbolName, stopLoss, takeProfit };
     }
-    return { ...d, symbolName };
+    return { ...d, symbolName, stopLoss, takeProfit };
   });
 }
 
@@ -484,12 +521,15 @@ async function handleDeals(req: Request): Promise<Response> {
       const rawDeals = await fetchDeals(send, nextMsg, accountId, from, to, tokenRef);
       console.log(`[ws] total raw deals: ${rawDeals.length}`);
 
-      // Step 4: Resolve symbol names
+      // Step 4: Resolve symbol names via SymbolsListReq (returns symbolName, unlike SymbolByIdReq)
       const uniqueIds = [...new Set(rawDeals.map(d => Number(d.symbolId)).filter(Boolean))];
       const symbolMap = await fetchSymbolMap(send, nextMsg, accountId, uniqueIds);
 
-      // Step 5: Normalize monetary values
-      result = normalizeDeals(rawDeals, symbolMap);
+      // Step 5: Fetch open positions to get SL/TP (not included in deal objects)
+      const positionMap = await fetchPositionMap(send, nextMsg, accountId);
+
+      // Step 6: Normalize monetary values and merge SL/TP
+      result = normalizeDeals(rawDeals, symbolMap, positionMap);
       console.log(`[deals] done: ${result.length} normalized deals`);
     }, env, tokenRef);
 

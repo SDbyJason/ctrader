@@ -1061,6 +1061,15 @@ async function handlePollNow(req: Request): Promise<Response> {
 
 // ─── Cron entry point ───────────────────────────────────────────
 
+/* Last tick, remembered in memory. This lives here rather than in the
+   Cloudflare worker on purpose: Workers run the cron handler in a different
+   isolate than incoming requests, so a counter there is invisible to anyone
+   checking the health URL. Render is one long-running process, so this
+   survives — and /health becomes the honest answer to "is it running?".
+   Resets on redeploy or when the free instance sleeps, which is fine: both
+   mean the next tick re-establishes it within minutes. */
+let _lastCron: Record<string, unknown> | null = null;
+
 async function handleCronPoll(req: Request): Promise<Response> {
   const secret = req.headers.get("X-Cron-Secret") || "";
   if (!getEnv("CRON_SECRET") || secret !== getEnv("CRON_SECRET"))
@@ -1094,8 +1103,10 @@ async function handleCronPoll(req: Request): Promise<Response> {
     }
   }
 
-  return jsonResp({ ok: true, polled, events, failed, skipped,
-                    ms: Date.now() - started, due: links.length });
+  const result = { ok: true, polled, events, failed, skipped,
+                   ms: Date.now() - started, due: links.length };
+  _lastCron = { at: new Date(started).toISOString(), ...result };
+  return jsonResp(result);
 }
 
 // ─── MAIN HANDLER ──────────────────────────────────────────────
@@ -1104,7 +1115,20 @@ async function handler(req: Request): Promise<Response> {
   const url = new URL(req.url);
   if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders() });
   try {
-    if (url.pathname === "/" || url.pathname === "/health")        return jsonResp({ ok: true });
+    if (url.pathname === "/" || url.pathname === "/health")
+      return jsonResp({
+        ok: true,
+        // Is the background sync actually ticking? This is the place to look.
+        cron: _lastCron
+          ? { ...(_lastCron as Record<string, unknown>),
+              secondsAgo: Math.round((Date.now() - Date.parse(String(_lastCron.at))) / 1000) }
+          : "no tick received since this instance started",
+        configured: {
+          firestore:  !!(getEnv("FB_PROJECT_ID") && getEnv("FB_CLIENT_EMAIL") && getEnv("FB_PRIVATE_KEY")),
+          encryption: getEnv("LINK_ENC_KEY").length > 0,
+          cronSecret: getEnv("CRON_SECRET").length > 0,
+        },
+      });
     if (url.pathname === "/oauth/start")                           return handleOAuthStart(url);
     if (url.pathname === "/oauth/callback")                        return await handleOAuthCallback(url);
     if (url.pathname === "/api/refresh"  && req.method === "POST") return await handleRefresh(req);

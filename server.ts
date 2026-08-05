@@ -603,7 +603,12 @@ async function handleDeals(req: Request): Promise<Response> {
 // ════════════════════════════════════════════════════════════════
 
 const POLL_BUDGET_MS   = 45_000;   // stay under Render's request timeout
-const POLL_MIN_GAP_MS  = 4 * 60_000;
+/* Floor between two polls of the SAME account — a safety net against a
+   misconfigured cron, not the schedule itself. Keep it comfortably BELOW the
+   cron interval, or the guard silently eats every other tick and the cadence
+   you configured is not the cadence you get. (It was 4 min against a 2 min
+   cron, which halved the effective rate and cost SL/TP on short trades.) */
+const POLL_MIN_GAP_MS  = 100_000;
 const MAX_ERRORS       = 8;        // then pause the link, stop burning budget
 const LOOKBACK_MS      = 3 * 24 * 3600 * 1000;
 

@@ -573,6 +573,531 @@ async function handleDeals(req: Request): Promise<Response> {
   }
 }
 
+// ════════════════════════════════════════════════════════════════
+//  BACKGROUND POLLER — sync while the app is closed
+//  ──────────────────────────────────────────────────────────────
+//  Everything above this line is request/response: the browser asks,
+//  we proxy. That only works while a tab is open, so SL/TP and closed
+//  trades were lost whenever the user was away — the "automatic
+//  journal" was only automatic while you watched it.
+//
+//  This section keeps the refresh token server-side (encrypted) and
+//  polls each linked account on a cron tick. Found trades are written
+//  as EVENTS into apexUsers/<uid>/inbox — the exact same channel the
+//  MT5/TradingView ingest worker uses. The web app already drains that
+//  inbox and owns the merge, so nothing here needs to understand pip
+//  math, and there is no read-modify-write race on the journal doc.
+//
+//  Endpoints added:
+//    POST /api/link    { uid, refresh_token, accountId, accountEnv }
+//    POST /api/unlink  { uid, accountId }
+//    GET  /api/link/status?uid=&accountId=
+//    POST /cron/poll   header: X-Cron-Secret  — driven by a Cloudflare
+//                      cron trigger (Render free has no scheduler and
+//                      sleeps; the tick both wakes and drives it)
+//
+//  Extra env vars:
+//    FB_PROJECT_ID, FB_CLIENT_EMAIL, FB_PRIVATE_KEY   (service account)
+//    LINK_ENC_KEY   base64 32 bytes — AES-GCM key for refresh tokens
+//    CRON_SECRET    shared secret for /cron/poll
+// ════════════════════════════════════════════════════════════════
+
+const POLL_BUDGET_MS   = 45_000;   // stay under Render's request timeout
+const POLL_MIN_GAP_MS  = 4 * 60_000;
+const MAX_ERRORS       = 8;        // then pause the link, stop burning budget
+const LOOKBACK_MS      = 3 * 24 * 3600 * 1000;
+
+// ─── Google service-account access token (cached) ───────────────
+
+let _gTok: { value: string; exp: number } = { value: "", exp: 0 };
+
+function b64url(bytes: Uint8Array): string {
+  return btoa(String.fromCharCode(...bytes))
+    .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+async function importServiceKey(pem: string): Promise<CryptoKey> {
+  // Robust against every paste variant: literal "\n", real newlines, quotes.
+  const body = pem
+    .replace(/\\n/g, "\n")
+    .replace(/-----[^-]+-----/g, "")
+    .replace(/[^A-Za-z0-9+/=]/g, "");
+  const der = Uint8Array.from(atob(body), c => c.charCodeAt(0));
+  return crypto.subtle.importKey("pkcs8", der.buffer,
+    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["sign"]);
+}
+
+async function googleToken(): Promise<string> {
+  const now = Math.floor(Date.now() / 1000);
+  if (_gTok.value && now < _gTok.exp - 60) return _gTok.value;
+
+  const enc = (o: unknown) => b64url(new TextEncoder().encode(JSON.stringify(o)));
+  const unsigned = enc({ alg: "RS256", typ: "JWT" }) + "." + enc({
+    iss:   getEnv("FB_CLIENT_EMAIL"),
+    scope: "https://www.googleapis.com/auth/datastore",
+    aud:   "https://oauth2.googleapis.com/token",
+    iat:   now,
+    exp:   now + 3600,
+  });
+  const key = await importServiceKey(getEnv("FB_PRIVATE_KEY"));
+  const sig = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", key,
+    new TextEncoder().encode(unsigned));
+  const jwt = `${unsigned}.${b64url(new Uint8Array(sig))}`;
+
+  const r = await fetch("https://oauth2.googleapis.com/token", {
+    method:  "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body:    `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${jwt}`,
+  });
+  const d = await r.json();
+  if (!d.access_token) throw new Error("google oauth: " + JSON.stringify(d));
+  _gTok = { value: d.access_token, exp: now + (d.expires_in || 3600) };
+  return _gTok.value;
+}
+
+// ─── Firestore REST ─────────────────────────────────────────────
+
+function fsBase(): string {
+  return `https://firestore.googleapis.com/v1/projects/${getEnv("FB_PROJECT_ID")}/databases/(default)/documents`;
+}
+// deno-lint-ignore no-explicit-any
+function fsVal(v: any): Record<string, unknown> {
+  if (v === null || v === undefined)  return { nullValue: null };
+  if (typeof v === "boolean")         return { booleanValue: v };
+  if (typeof v === "number")
+    return Number.isInteger(v) ? { integerValue: String(v) } : { doubleValue: v };
+  return { stringValue: String(v) };
+}
+function fsFields(obj: Record<string, unknown>) {
+  const fields: Record<string, unknown> = {};
+  for (const k in obj) fields[k] = fsVal(obj[k]);
+  return { fields };
+}
+// deno-lint-ignore no-explicit-any
+function fsRead(doc: any): Record<string, any> {
+  const out: Record<string, unknown> = {};
+  const f = (doc && doc.fields) || {};
+  for (const k in f) {
+    const v = f[k];
+    out[k] = v.stringValue !== undefined  ? v.stringValue
+           : v.integerValue !== undefined ? Number(v.integerValue)
+           : v.doubleValue !== undefined  ? v.doubleValue
+           : v.booleanValue !== undefined ? v.booleanValue
+           : null;
+  }
+  return out;
+}
+
+async function fsGet(path: string): Promise<Record<string, unknown> | null> {
+  const r = await fetch(`${fsBase()}/${path}`, {
+    headers: { Authorization: `Bearer ${await googleToken()}` },
+  });
+  if (r.status === 404) return null;
+  if (!r.ok) throw new Error(`fsGet ${r.status} ${await r.text()}`);
+  return fsRead(await r.json());
+}
+async function fsSet(path: string, data: Record<string, unknown>): Promise<void> {
+  // updateMask so a partial write never wipes fields it does not mention
+  const mask = Object.keys(data).map(k => `updateMask.fieldPaths=${encodeURIComponent(k)}`).join("&");
+  const r = await fetch(`${fsBase()}/${path}?${mask}`, {
+    method:  "PATCH",
+    headers: { Authorization: `Bearer ${await googleToken()}`, "Content-Type": "application/json" },
+    body:    JSON.stringify(fsFields(data)),
+  });
+  if (!r.ok) throw new Error(`fsSet ${r.status} ${await r.text()}`);
+}
+async function fsDelete(path: string): Promise<void> {
+  await fetch(`${fsBase()}/${path}`, {
+    method: "DELETE", headers: { Authorization: `Bearer ${await googleToken()}` },
+  });
+}
+async function fsCreate(collection: string, data: Record<string, unknown>): Promise<void> {
+  const r = await fetch(`${fsBase()}/${collection}`, {
+    method:  "POST",
+    headers: { Authorization: `Bearer ${await googleToken()}`, "Content-Type": "application/json" },
+    body:    JSON.stringify(fsFields(data)),
+  });
+  if (!r.ok) throw new Error(`fsCreate ${r.status} ${await r.text()}`);
+}
+// Links due for a poll, oldest first — a plain query so one slow account
+// cannot starve the others.
+async function fsDueLinks(limit: number): Promise<Array<Record<string, unknown>>> {
+  const body = {
+    structuredQuery: {
+      from:    [{ collectionId: "brokerLinks" }],
+      where:   { fieldFilter: { field: { fieldPath: "status" }, op: "EQUAL",
+                                value: { stringValue: "active" } } },
+      orderBy: [{ field: { fieldPath: "lastPollAt" }, direction: "ASCENDING" }],
+      limit,
+    },
+  };
+  const r = await fetch(`${fsBase()}:runQuery`, {
+    method:  "POST",
+    headers: { Authorization: `Bearer ${await googleToken()}`, "Content-Type": "application/json" },
+    body:    JSON.stringify(body),
+  });
+  if (!r.ok) throw new Error(`fsQuery ${r.status} ${await r.text()}`);
+  const rows = await r.json();
+  return (rows as Array<Record<string, unknown>>)
+    // deno-lint-ignore no-explicit-any
+    .filter((x: any) => x.document)
+    // deno-lint-ignore no-explicit-any
+    .map((x: any) => ({ ...fsRead(x.document), _name: x.document.name.split("/documents/")[1] }));
+}
+
+// ─── Refresh-token encryption (AES-GCM) ─────────────────────────
+// The poller has to keep a long-lived broker credential. Storing it in
+// plaintext would mean a Firestore read is enough to trade-read someone's
+// account, so the key lives only in the worker's environment.
+
+async function encKey(): Promise<CryptoKey> {
+  const raw = Uint8Array.from(atob(getEnv("LINK_ENC_KEY")), c => c.charCodeAt(0));
+  if (raw.length !== 32) throw new Error("LINK_ENC_KEY must be 32 bytes, base64-encoded");
+  return crypto.subtle.importKey("raw", raw, "AES-GCM", false, ["encrypt", "decrypt"]);
+}
+async function encryptToken(plain: string): Promise<string> {
+  const iv  = crypto.getRandomValues(new Uint8Array(12));
+  const buf = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, await encKey(),
+    new TextEncoder().encode(plain));
+  const out = new Uint8Array(iv.length + buf.byteLength);
+  out.set(iv, 0); out.set(new Uint8Array(buf), iv.length);
+  return btoa(String.fromCharCode(...out));
+}
+async function decryptToken(blob: string): Promise<string> {
+  const all = Uint8Array.from(atob(blob), c => c.charCodeAt(0));
+  const buf = await crypto.subtle.decrypt(
+    { name: "AES-GCM", iv: all.slice(0, 12) }, await encKey(), all.slice(12));
+  return new TextDecoder().decode(buf);
+}
+
+// ─── Link management ────────────────────────────────────────────
+
+function linkPath(uid: string, accountId: number): string {
+  return `brokerLinks/${uid}__${accountId}`;
+}
+
+async function handleLink(req: Request): Promise<Response> {
+  let body: Record<string, unknown>;
+  try { body = await req.json(); } catch { return jsonResp({ error: "Invalid JSON" }, 400); }
+
+  const uid       = String(body.uid || "");
+  const refresh   = String(body.refresh_token || "");
+  const accountId = Number(body.accountId || 0);
+  const env       = String(body.accountEnv || "demo");
+  if (!uid || !refresh || !accountId) return jsonResp({ error: "Missing params" }, 400);
+
+  const existing = await fsGet(linkPath(uid, accountId));
+  await fsSet(linkPath(uid, accountId), {
+    uid, provider: "ctrader", accountId, accountEnv: env,
+    refreshTokenEnc: await encryptToken(refresh),
+    status: "active", errorCount: 0, lastError: "",
+    // Keep the cursor on re-link so reconnecting does not replay old trades
+    lastDealTs: Number(existing?.lastDealTs || (Date.now() - LOOKBACK_MS)),
+    knownOpen:  String(existing?.knownOpen || "{}"),
+    lastPollAt: 0,
+    updatedAt:  Date.now(),
+  });
+  console.log(`[link] ${uid} account ${accountId} (${env}) linked for background sync`);
+  return jsonResp({ ok: true });
+}
+
+async function handleUnlink(req: Request): Promise<Response> {
+  let body: Record<string, unknown>;
+  try { body = await req.json(); } catch { return jsonResp({ error: "Invalid JSON" }, 400); }
+  const uid = String(body.uid || ""), accountId = Number(body.accountId || 0);
+  if (!uid || !accountId) return jsonResp({ error: "Missing params" }, 400);
+  await fsDelete(linkPath(uid, accountId));
+  console.log(`[link] ${uid} account ${accountId} unlinked`);
+  return jsonResp({ ok: true });
+}
+
+async function handleLinkStatus(url: URL): Promise<Response> {
+  const uid = url.searchParams.get("uid") || "";
+  const accountId = Number(url.searchParams.get("accountId") || 0);
+  if (!uid || !accountId) return jsonResp({ error: "Missing params" }, 400);
+  const doc = await fsGet(linkPath(uid, accountId));
+  if (!doc) return jsonResp({ linked: false });
+  return jsonResp({
+    linked:     true,
+    status:     doc.status,
+    lastPollAt: doc.lastPollAt || 0,
+    lastError:  doc.status === "active" ? "" : (doc.lastError || ""),
+  });
+}
+
+// ─── Event emission ─────────────────────────────────────────────
+// Same shape the ingest worker writes, so the app's existing inbox
+// drainer merges cTrader background trades with no changes.
+
+function emitEvent(uid: string, ev: Record<string, unknown>): Promise<void> {
+  return fsCreate(`apexUsers/${uid}/inbox`, {
+    source: "ctrader", receivedAt: Date.now(), ...ev,
+  });
+}
+
+function toMs(ts: unknown): number | null {
+  if (!ts) return null;
+  const n = Number(ts);
+  if (!Number.isFinite(n)) return null;
+  return (n > 946684800 && n < 32503680000) ? n * 1000 : n;
+}
+function dirOfDeal(d: Record<string, unknown>): string {
+  const raw = String(d.tradeSide ?? d.dealType ?? "").toUpperCase();
+  const num = Number(d.tradeSide || 0);
+  if (raw.includes("BUY")  || raw === "LONG"  || num === 1) return "long";
+  if (raw.includes("SELL") || raw === "SHORT" || num === 2) return "short";
+  return "";
+}
+
+// ─── Event diffing (pure — see ctraderapi.test.js) ──────────────
+//
+// The only stateful thing a poll has to decide is: which of these deals
+// has the journal not heard about yet? `knownOpen` answers that. It maps
+// positionId → "<sl>|<tp>" while a position is open, and → "closed" once
+// its exit has been sent, so a redelivered deal (the cursor overlaps on
+// purpose) produces nothing the second time.
+//
+// Positions that opened AND closed between two ticks are the normal case
+// when the app was shut. For those the open event is synthesised from the
+// opening deal, so the journal keeps the entry price instead of a bare
+// exit row. Their SL/TP is genuinely unrecoverable — cTrader only exposes
+// protection levels on positions that are currently open — which is why
+// the cron interval, not this function, decides how much detail survives.
+
+interface PollDiff {
+  events: Array<Record<string, unknown>>;
+  known:  Record<string, string>;
+  maxTs:  number;
+}
+
+function buildEvents(
+  deals: Array<Record<string, unknown>>,
+  openPositions: Array<Record<string, unknown>>,
+  knownRaw: unknown,
+  from: number,
+): PollDiff {
+  const groups = new Map<string, Array<Record<string, unknown>>>();
+  for (const d of deals) {
+    const pid = String(d.positionId ?? d.dealId ?? "");
+    if (!pid) continue;
+    if (!groups.has(pid)) groups.set(pid, []);
+    groups.get(pid)!.push(d);
+  }
+
+  let known: Record<string, string> = {};
+  try { known = JSON.parse(String(knownRaw || "{}")); } catch { known = {}; }
+
+  const openNow = new Map<string, Record<string, unknown>>();
+  for (const p of openPositions) openNow.set(String(p.positionId), p);
+
+  const events: Array<Record<string, unknown>> = [];
+  let maxTs = from;
+
+  for (const [pid, group] of groups) {
+    group.sort((a, b) =>
+      (toMs(a.executionTimestamp || a.createTimestamp) || 0) -
+      (toMs(b.executionTimestamp || b.createTimestamp) || 0));
+    const openDeal  = group[0];
+    const closeDeal = group[group.length - 1];
+    const cpd = (closeDeal.closePositionDetail || openDeal.closePositionDetail) as
+      Record<string, unknown> | undefined;
+
+    const openTs  = toMs(openDeal.executionTimestamp  || openDeal.createTimestamp);
+    const closeTs = toMs(closeDeal.executionTimestamp || closeDeal.createTimestamp);
+    if (closeTs && closeTs > maxTs) maxTs = closeTs;
+    if (openTs  && openTs  > maxTs) maxTs = openTs;
+
+    const live   = openNow.get(pid);
+    const sl     = live ? (live.stopLoss   ?? null) : null;
+    const tp     = live ? (live.takeProfit ?? null) : null;
+    const symbol = String(closeDeal.symbolName || openDeal.symbolName || "");
+    // cTrader volume is in units of 0.01 lots (10000 = 1.00 lot)
+    const rawVol = Number(openDeal.volume || openDeal.filledVolume || 0);
+    const volume = rawVol > 0 ? rawVol / 10000 : null;
+    const entryPrice = Number(openDeal.executionPrice ?? openDeal.price ?? 0) || null;
+
+    if (!cpd) {
+      const sig = `${sl ?? ""}|${tp ?? ""}`;
+      if (known[pid] === undefined) {
+        events.push({ event: "open", symbol, dir: dirOfDeal(openDeal), price: entryPrice,
+                      sl, tp, volume, time: openTs || Date.now(), posId: pid });
+      } else if (known[pid] !== sig && known[pid] !== "closed") {
+        events.push({ event: "modify", symbol, sl, tp, posId: pid, time: Date.now() });
+      }
+      if (known[pid] !== "closed") known[pid] = sig;
+      continue;
+    }
+
+    if (known[pid] === "closed") continue;          // already reported
+
+    if (known[pid] === undefined) {
+      events.push({ event: "open", symbol, dir: dirOfDeal(openDeal), price: entryPrice,
+                    sl, tp, volume, time: openTs || closeTs || Date.now(), posId: pid });
+    }
+    const gross = cpd.grossProfit !== undefined ? Number(cpd.grossProfit) : Number(cpd.netProfit || 0);
+    events.push({
+      event: "close", symbol, dir: dirOfDeal(openDeal),
+      price: Number(closeDeal.executionPrice ?? closeDeal.price ?? 0) || null,
+      volume, pnl: gross,
+      commission: cpd.commission !== undefined ? Number(cpd.commission) : null,
+      swap:       cpd.swap       !== undefined ? Number(cpd.swap)       : null,
+      time: closeTs || Date.now(), posId: pid,
+    });
+    known[pid] = "closed";
+  }
+
+  // Closed positions only need to be remembered long enough to outlive the
+  // cursor overlap that redelivers them; otherwise the map grows forever.
+  const trimmed: Record<string, string> = {};
+  for (const pid of Object.keys(known)) {
+    if (known[pid] !== "closed" || openNow.has(pid) || groups.has(pid)) trimmed[pid] = known[pid];
+  }
+
+  return { events, known: trimmed, maxTs };
+}
+
+// ─── One account ────────────────────────────────────────────────
+
+async function pollLink(link: Record<string, unknown>): Promise<number> {
+  const uid       = String(link.uid);
+  const accountId = Number(link.accountId);
+  const env       = String(link.accountEnv || "demo");
+  const path      = linkPath(uid, accountId);
+
+  const tokenRef: TokenRef = {
+    accessToken:  "",
+    refreshToken: await decryptToken(String(link.refreshTokenEnc)),
+  };
+
+  // A fresh access token every cycle: it is cheap and avoids storing one.
+  const refreshed = await httpRefreshToken(tokenRef.refreshToken);
+  if (!refreshed) {
+    // The user revoked access, or the refresh token expired.
+    await fsSet(path, {
+      status: "reauth_required", lastPollAt: Date.now(),
+      lastError: "cTrader rejected the stored credentials — please reconnect.",
+      updatedAt: Date.now(),
+    });
+    console.warn(`[poll] ${uid}/${accountId}: refresh rejected → reauth_required`);
+    return 0;
+  }
+  tokenRef.accessToken  = refreshed.accessToken;
+  tokenRef.refreshToken = refreshed.refreshToken;
+
+  const from = Number(link.lastDealTs || (Date.now() - LOOKBACK_MS));
+  const to   = Date.now();
+
+  let deals: Array<Record<string, unknown>> = [];
+  let openPositions: Array<Record<string, unknown>> = [];
+
+  await withCtraderWS(async (send, nextMsg) => {
+    send(PT_APP_AUTH_REQ, {
+      clientId: getEnv("CTRADER_CLIENT_ID"), clientSecret: getEnv("CTRADER_CLIENT_SECRET"),
+    }, "app_auth");
+    await waitFor(nextMsg, PT_APP_AUTH_RES);
+
+    send(PT_ACCOUNT_AUTH_REQ, {
+      ctidTraderAccountId: accountId, accessToken: tokenRef.accessToken,
+    }, "acc_auth");
+    await waitFor(nextMsg, PT_ACCOUNT_AUTH_RES);
+
+    const symbolMap = await fetchSymbolMap(send, nextMsg, accountId);
+    // A little overlap on the cursor: a deal can be written just after the
+    // previous poll read its window. Duplicates are free (the drainer keys
+    // on positionId), a missed close is not.
+    deals = normalizeDeals(
+      await fetchDeals(send, nextMsg, accountId, Math.max(0, from - 60_000), to, tokenRef),
+      symbolMap);
+    try {
+      openPositions = await fetchOpenPositions(send, nextMsg, accountId, symbolMap);
+    } catch (e) {
+      console.warn("[poll] reconcile failed (non-fatal):", e instanceof Error ? e.message : e);
+    }
+  }, env, tokenRef);
+
+  const { events, known, maxTs } = buildEvents(deals, openPositions, link.knownOpen, from);
+  for (const ev of events) await emitEvent(uid, ev);
+
+  await fsSet(path, {
+    refreshTokenEnc: await encryptToken(tokenRef.refreshToken),   // cTrader rotates it
+    lastDealTs: maxTs,
+    knownOpen:  JSON.stringify(known).slice(0, 900_000),
+    lastPollAt: Date.now(),
+    status: "active", errorCount: 0, lastError: "",
+    updatedAt: Date.now(),
+  });
+
+  console.log(`[poll] ${uid}/${accountId}: ${deals.length} deals → ${events.length} events`);
+  return events.length;
+}
+
+// On-demand poll for a single account — this is what "Sync Now" calls once
+// background sync owns the credential. Rate-limited so it cannot be used to
+// hammer cTrader; it returns counts only, never account data, so the worst a
+// guessed uid achieves is an extra poll of that user's own account.
+async function handlePollNow(req: Request): Promise<Response> {
+  let body: Record<string, unknown>;
+  try { body = await req.json(); } catch { return jsonResp({ error: "Invalid JSON" }, 400); }
+  const uid = String(body.uid || ""), accountId = Number(body.accountId || 0);
+  if (!uid || !accountId) return jsonResp({ error: "Missing params" }, 400);
+
+  const path = linkPath(uid, accountId);
+  const link = await fsGet(path);
+  if (!link) return jsonResp({ error: "not_linked" }, 404);
+  if (link.status === "reauth_required") return jsonResp({ error: "reauth_required" }, 409);
+
+  if (Date.now() - Number(link.lastPollAt || 0) < 30_000)
+    return jsonResp({ ok: true, throttled: true, events: 0 });
+
+  try {
+    const events = await pollLink({ ...link, _name: path });
+    return jsonResp({ ok: true, events });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error(`[poll-now] ${uid}/${accountId}: ${msg}`);
+    return jsonResp({ error: msg }, 502);
+  }
+}
+
+// ─── Cron entry point ───────────────────────────────────────────
+
+async function handleCronPoll(req: Request): Promise<Response> {
+  const secret = req.headers.get("X-Cron-Secret") || "";
+  if (!getEnv("CRON_SECRET") || secret !== getEnv("CRON_SECRET"))
+    return jsonResp({ error: "forbidden" }, 403);
+
+  const started = Date.now();
+  let links: Array<Record<string, unknown>>;
+  try { links = await fsDueLinks(40); }
+  catch (e) { return jsonResp({ error: String(e) }, 500); }
+
+  let polled = 0, events = 0, failed = 0, skipped = 0;
+
+  for (const link of links) {
+    if (Date.now() - started > POLL_BUDGET_MS) break;   // next tick continues
+    if (Date.now() - Number(link.lastPollAt || 0) < POLL_MIN_GAP_MS) { skipped++; continue; }
+    try {
+      events += await pollLink(link);
+      polled++;
+    } catch (e) {
+      failed++;
+      const msg = e instanceof Error ? e.message : String(e);
+      const n   = Number(link.errorCount || 0) + 1;
+      console.error(`[poll] ${link.uid}/${link.accountId} failed (${n}): ${msg}`);
+      try {
+        await fsSet(String(link._name), {
+          errorCount: n, lastError: msg.slice(0, 300), lastPollAt: Date.now(),
+          status: n >= MAX_ERRORS ? "paused" : "active",
+          updatedAt: Date.now(),
+        });
+      } catch { /* the next tick will retry */ }
+    }
+  }
+
+  return jsonResp({ ok: true, polled, events, failed, skipped,
+                    ms: Date.now() - started, due: links.length });
+}
+
 // ─── MAIN HANDLER ──────────────────────────────────────────────
 
 async function handler(req: Request): Promise<Response> {
@@ -585,6 +1110,12 @@ async function handler(req: Request): Promise<Response> {
     if (url.pathname === "/api/refresh"  && req.method === "POST") return await handleRefresh(req);
     if (url.pathname === "/api/accounts" && req.method === "POST") return await handleAccounts(req);
     if (url.pathname === "/api/deals"    && req.method === "POST") return await handleDeals(req);
+    // Background sync (see the POLLER section above)
+    if (url.pathname === "/api/link"        && req.method === "POST") return await handleLink(req);
+    if (url.pathname === "/api/unlink"      && req.method === "POST") return await handleUnlink(req);
+    if (url.pathname === "/api/link/status" && req.method === "GET")  return await handleLinkStatus(url);
+    if (url.pathname === "/api/poll-now"    && req.method === "POST") return await handlePollNow(req);
+    if (url.pathname === "/cron/poll"       && req.method === "POST") return await handleCronPoll(req);
     return jsonResp({ error: "Not found" }, 404);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

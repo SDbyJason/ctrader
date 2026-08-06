@@ -33,7 +33,45 @@
 const OAUTH_BASE      = "https://openapi.ctrader.com";
 const WS_DEMO         = "wss://demo.ctraderapi.com:5036";
 const WS_LIVE         = "wss://live.ctraderapi.com:5036";
-const FALLBACK_ORIGIN = "https://sdbyjason.github.io/Apex-Trading-Journal";
+const FALLBACK_ORIGIN = "https://evidencetrading.com";
+
+/* Origins allowed to talk to this bridge. ALLOWED_ORIGIN (env) may hold a
+   comma-separated list and is merged with these defaults, so adding a domain
+   never means losing the ones already here — the single-value env var is what
+   broke evidencetrading.com when the app moved off the github.io host.
+   This list guards two different things:
+     1. the CORS Access-Control-Allow-Origin header, and
+     2. the OAuth return origin, which carries the cTrader access AND refresh
+        token in the URL hash. That one matters: /oauth/start takes the origin
+        from a query parameter, so without this check anyone could send a user
+        through a crafted link and have the tokens redirected to their own
+        host. Unknown origins fall back to FALLBACK_ORIGIN. */
+const DEFAULT_ORIGINS = [
+  "https://evidencetrading.com",
+  "https://www.evidencetrading.com",
+  "https://sdbyjason.github.io",
+];
+function allowedOrigins(): string[] {
+  const fromEnv = getEnv("ALLOWED_ORIGIN")
+    .split(",").map(s => s.trim().replace(/\/+$/, "")).filter(Boolean);
+  return [...new Set([...fromEnv, ...DEFAULT_ORIGINS])];
+}
+/** Origin part of a URL ("https://host.tld"), or "" if it is not parseable. */
+function originOf(u: string): string {
+  try { return new URL(u).origin; } catch { return ""; }
+}
+/** True if `u` (a full URL or bare origin) sits on an allowed origin. */
+function isAllowedOrigin(u: string): boolean {
+  const norm = originOf(u);
+  return !!norm && allowedOrigins().some(o => originOf(o) === norm);
+}
+/** The request's Origin if we allow it, otherwise "". */
+function matchOrigin(req?: Request): string {
+  const sent = req?.headers.get("Origin") || "";
+  if (!sent) return "";
+  const norm = originOf(sent);
+  return allowedOrigins().some(o => originOf(o) === norm) ? sent : "";
+}
 
 // Payload types per ProtoOAPayloadType enum
 const PT_APP_AUTH_REQ      = 2100;
@@ -53,10 +91,15 @@ const PT_OA_ERROR_RES      = 2142; // ProtoOAErrorRes
 
 function getEnv(k: string): string { return Deno.env.get(k) || ""; }
 
-function corsHeaders(): Record<string, string> {
-  const origin = getEnv("ALLOWED_ORIGIN") || "*";
+function corsHeaders(req?: Request): Record<string, string> {
+  // Echo the caller's Origin when it is on the allowlist. Echoing (rather than
+  // sending a fixed value) is what lets several front-end hosts share one
+  // bridge; "Vary: Origin" keeps caches from serving one host's header to
+  // another. Callers without an Origin header get the primary domain.
+  const origin = matchOrigin(req) || FALLBACK_ORIGIN;
   return {
     "Access-Control-Allow-Origin":  origin,
+    "Vary":                         "Origin",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type, Authorization",
     "Access-Control-Max-Age":       "86400",
@@ -385,6 +428,10 @@ function handleOAuthStart(url: URL): Response {
   const origin = url.searchParams.get("origin") || "";
   if (!uid)    return new Response("Missing uid",    { status: 400 });
   if (!origin) return new Response("Missing origin", { status: 400 });
+  // Reject unknown return origins here, at the start of the flow, so the user
+  // sees an error instead of handing cTrader tokens to someone else's host.
+  if (!isAllowedOrigin(origin))
+    return new Response("Origin not allowed", { status: 400 });
   const state  = b64urlEncode({ uid, env, origin, t: Date.now() });
   const params = new URLSearchParams({
     client_id:     getEnv("CTRADER_CLIENT_ID"),
@@ -402,7 +449,10 @@ async function handleOAuthCallback(url: URL): Promise<Response> {
   const errParam = url.searchParams.get("error");
   let parsed: Record<string, unknown> | null = null;
   if (state) { try { parsed = b64urlDecode(state); } catch { /* ignore */ } }
-  const origin = (parsed && typeof parsed.origin === "string") ? parsed.origin : FALLBACK_ORIGIN;
+  // Re-checked on the way back too: the state blob is only base64url, not
+  // signed, so it must not be trusted to name the redirect target on its own.
+  const claimed = (parsed && typeof parsed.origin === "string") ? parsed.origin : "";
+  const origin  = isAllowedOrigin(claimed) ? claimed : FALLBACK_ORIGIN;
   if (errParam || !code) return redirectWithHash(origin, { ok: false, error: errParam || "Missing code" });
   const tokenRes  = await fetch(`${OAUTH_BASE}/apps/token`, {
     method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -1118,7 +1168,7 @@ async function handleCronPoll(req: Request): Promise<Response> {
 
 async function handler(req: Request): Promise<Response> {
   const url = new URL(req.url);
-  if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders() });
+  if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders(req) });
   try {
     if (url.pathname === "/" || url.pathname === "/health")
       return jsonResp({
@@ -1150,7 +1200,7 @@ async function handler(req: Request): Promise<Response> {
     const msg = err instanceof Error ? err.message : String(err);
     console.error("[handler] error:", msg);
     return new Response(JSON.stringify({ error: msg }), {
-      status: 500, headers: { "Content-Type": "application/json", ...corsHeaders() },
+      status: 500, headers: { "Content-Type": "application/json", ...corsHeaders(req) },
     });
   }
 }
@@ -1158,16 +1208,20 @@ async function handler(req: Request): Promise<Response> {
 const PORT = parseInt(getEnv("PORT") || "8000");
 Deno.serve({ port: PORT }, async (req) => {
   if (req.method === "OPTIONS")
-    return new Response(null, { status: 204, headers: corsHeaders() });
+    return new Response(null, { status: 204, headers: corsHeaders(req) });
   try {
     const res     = await handler(req);
+    // The OAuth routes answer with a 302 whose Location is the whole point of
+    // the request — leave redirects untouched, CORS headers are meaningless
+    // there and rewriting the response would drop the Location on some paths.
+    if (res.status >= 300 && res.status < 400) return res;
     const headers = new Headers(res.headers);
-    for (const [k, v] of Object.entries(corsHeaders())) headers.set(k, v);
+    for (const [k, v] of Object.entries(corsHeaders(req))) headers.set(k, v);
     return new Response(res.body, { status: res.status, headers });
   } catch (err) {
     console.error("[top-level]", err);
     return new Response(JSON.stringify({ error: String(err) }), {
-      status: 500, headers: { "Content-Type": "application/json", ...corsHeaders() },
+      status: 500, headers: { "Content-Type": "application/json", ...corsHeaders(req) },
     });
   }
 });

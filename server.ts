@@ -872,11 +872,17 @@ async function handleLinkStatus(url: URL): Promise<Response> {
   if (!uid || !accountId) return jsonResp({ error: "Missing params" }, 400);
   const doc = await fsGet(linkPath(uid, accountId));
   if (!doc) return jsonResp({ linked: false });
+  /* errorCount is reported even while the link still counts as active:
+     three failures in a row is already worth showing on the status screen,
+     and hiding it until the link is paused is how a broken sync stays
+     invisible for a week. */
+  const errors = Number(doc.errorCount || 0);
   return jsonResp({
     linked:     true,
     status:     doc.status,
     lastPollAt: doc.lastPollAt || 0,
-    lastError:  doc.status === "active" ? "" : (doc.lastError || ""),
+    errorCount: errors,
+    lastError:  (doc.status === "active" && errors === 0) ? "" : (doc.lastError || ""),
   });
 }
 
@@ -888,6 +894,60 @@ function emitEvent(uid: string, ev: Record<string, unknown>): Promise<void> {
   return fsCreate(`apexUsers/${uid}/inbox`, {
     source: "ctrader", receivedAt: Date.now(), ...ev,
   });
+}
+
+/* A link that quietly stops syncing is the worst failure this product has:
+   the trader notices weeks later, and by then they trust no number in the
+   journal. So after three consecutive failures — not the eighth, which is
+   where the link gets paused — we say so out loud, once, in both channels
+   the user actually looks at: the in-app inbox and their mailbox.
+
+   Sent exactly once per outage. The counter resets to 0 on the first
+   successful poll, so the next outage gets its own alert. */
+const FAIL_ALERT_AT = 3;
+
+async function alertSyncFailure(link: Record<string, unknown>, msg: string): Promise<void> {
+  const uid = String(link.uid || "");
+  if (!uid) return;
+  const label = String(link.accountLabel || link.accountId || "your cTrader account");
+
+  try {
+    await emitEvent(uid, {
+      type: "sync_failed",
+      account: label,
+      error: msg.slice(0, 300),
+      at: Date.now(),
+    });
+  } catch { /* the mail below is the more important half */ }
+
+  const key = getEnv("RESEND_API_KEY");
+  if (!key) return;
+  let email = "";
+  try {
+    const doc = await fsGet(`apexUserEmails/${uid}`);
+    email = String((doc && (doc.email as string)) || "");
+  } catch { /* no address on file — the inbox event still stands */ }
+  if (!email) return;
+
+  const esc = (v: string) => v.replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c] as string));
+  try {
+    await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        from: getEnv("MAIL_FROM") || "Evidence Trading <noreply@evidence-trading.com>",
+        to: [email],
+        subject: "Your broker connection stopped syncing",
+        html:
+          `<p>Your cTrader connection <b>${esc(label)}</b> has failed to sync three times in a row, ` +
+          `so no new trades are reaching your journal right now.</p>` +
+          `<p>What the broker reported:<br><code>${esc(msg.slice(0, 200))}</code></p>` +
+          `<p>This is almost always one of: the account password was changed, the account expired, ` +
+          `or the prop firm moved its server. Reconnecting in <b>Settings &rarr; Auto Tracking</b> fixes it.</p>` +
+          `<p style="color:#888;font-size:12px">You are getting this once per outage, not once per attempt.</p>`,
+      }),
+    });
+  } catch (e) { console.error("[poll] failure mail", e); }
 }
 
 function toMs(ts: unknown): number | null {
@@ -1155,6 +1215,8 @@ async function handleCronPoll(req: Request): Promise<Response> {
           updatedAt: Date.now(),
         });
       } catch { /* the next tick will retry */ }
+      // Exactly at the threshold, so a long outage does not mail every tick.
+      if (n === FAIL_ALERT_AT) { try { await alertSyncFailure(link, msg); } catch { /* best effort */ } }
     }
   }
 
@@ -1189,6 +1251,8 @@ async function handler(req: Request): Promise<Response> {
     if (url.pathname === "/api/refresh"  && req.method === "POST") return await handleRefresh(req);
     if (url.pathname === "/api/accounts" && req.method === "POST") return await handleAccounts(req);
     if (url.pathname === "/api/deals"    && req.method === "POST") return await handleDeals(req);
+    if (url.pathname === "/api/spots/start" && req.method === "POST") return await handleSpotsStart(req);
+    if (url.pathname === "/api/spots"       && req.method === "GET")  return handleSpots(url);
     // Background sync (see the POLLER section above)
     if (url.pathname === "/api/link"        && req.method === "POST") return await handleLink(req);
     if (url.pathname === "/api/unlink"      && req.method === "POST") return await handleUnlink(req);
@@ -1203,6 +1267,268 @@ async function handler(req: Request): Promise<Response> {
       status: 500, headers: { "Content-Type": "application/json", ...corsHeaders(req) },
     });
   }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  LIVE-KURSE (Spot-Abonnement)
+//  ─────────────────────────────────────────────────────────────────
+//  Warum das hier anders funktioniert als alles darueber: withCtraderWS()
+//  oeffnet eine Verbindung, erledigt eine Aufgabe und SCHLIESST sie wieder.
+//  Fuer laufende Kurse braucht es das Gegenteil — eine Verbindung, die
+//  offen bleibt und Ereignisse entgegennimmt. Deshalb ein eigener,
+//  dauerhafter Verbinder statt einer Erweiterung des vorhandenen.
+//
+//  Warum ueberhaupt: die Kerzen-API liefert nur ABGESCHLOSSENE Kerzen. Die
+//  laufende Minute erscheint dort erst, wenn sie vorbei ist — gemessen rund
+//  zwei Minuten Rueckstand. Fuer M1-Handel ist das zu viel. Der Spot-Strom
+//  des eigenen Brokers liefert dagegen im Sekundentakt und, wichtiger, die
+//  Kurse, zu denen auch wirklich gefuellt wird.
+//
+//  Zugangsdaten werden NICHT gespeichert. Der Client schickt sein Token beim
+//  Start mit, genau wie bei den anderen Routen; die Verbindung haengt an
+//  seiner Konto-Kennung und wird nach Leerlauf geschlossen.
+// ═══════════════════════════════════════════════════════════════════
+
+const PT_SUBSCRIBE_SPOTS_REQ   = 2127;
+const PT_SUBSCRIBE_SPOTS_RES   = 2128;
+const PT_UNSUBSCRIBE_SPOTS_REQ = 2129;
+const PT_SPOT_EVENT            = 2131;
+
+// cTrader liefert Kurse als ganze Zahlen, skaliert mit 10^5. 433412345
+// bedeutet also 4334,12345. Das ist die dokumentierte Konvention fuer
+// ProtoOASpotEvent — sollte ein Broker davon abweichen, faellt es sofort auf,
+// weil der Kurs um Zehnerpotenzen danebenliegt. Deshalb wird der Rohwert
+// mitgeliefert (siehe `raw` unten).
+const SPOT_SCALE = 100000;
+
+// Nach dieser Zeit ohne Abfrage wird die Verbindung geschlossen. Sonst
+// haelt eine vergessene Sitzung den Strom endlos offen.
+const FEED_IDLE_MS = 5 * 60_000;
+
+type Quote = { bid: number; ask: number; raw: number; ts: number };
+
+type Feed = {
+  accountId: number;
+  ws: WebSocket | null;
+  ready: boolean;
+  quotes: Map<string, Quote>;      // Symbolname → Kurs
+  ids: Map<string, number>;        // Symbolname → symbolId
+  namen: Map<number, string>;      // symbolId → Symbolname
+  abonniert: Set<number>;
+  letzteAbfrage: number;
+  heartbeat: number | null;
+  fehler: string | null;
+};
+
+const feeds = new Map<number, Feed>();
+
+function feedSchliessen(f: Feed, grund: string) {
+  console.log(`[spots] closing feed for ${f.accountId}: ${grund}`);
+  if (f.heartbeat !== null) clearInterval(f.heartbeat);
+  f.heartbeat = null;
+  try { f.ws?.close(); } catch { /* ignore */ }
+  f.ws = null; f.ready = false;
+  feeds.delete(f.accountId);
+}
+
+// Leerlauf-Waechter: laeuft einmal pro Minute ueber alle Stroeme.
+setInterval(() => {
+  const jetzt = Date.now();
+  for (const f of [...feeds.values()]) {
+    if (jetzt - f.letzteAbfrage > FEED_IDLE_MS) feedSchliessen(f, "idle");
+  }
+}, 60_000);
+
+async function feedStarten(
+  accountId: number, env: string, tokenRef: TokenRef, symbole: string[]
+): Promise<Feed> {
+  const vorhanden = feeds.get(accountId);
+  if (vorhanden && vorhanden.ready) {
+    vorhanden.letzteAbfrage = Date.now();
+    await abonnieren(vorhanden, symbole);
+    return vorhanden;
+  }
+  if (vorhanden) feedSchliessen(vorhanden, "restart");
+
+  const f: Feed = {
+    accountId, ws: null, ready: false,
+    quotes: new Map(), ids: new Map(), namen: new Map(),
+    abonniert: new Set(), letzteAbfrage: Date.now(),
+    heartbeat: null, fehler: null,
+  };
+  feeds.set(accountId, f);
+
+  const wsUrl = env === "live" ? WS_LIVE : WS_DEMO;
+  console.log(`[spots] connecting ${wsUrl} for ${accountId}`);
+
+  await new Promise<void>((resolve, reject) => {
+    const ws = new WebSocket(wsUrl);
+    f.ws = ws;
+    const warten: ((m: Record<string, unknown>) => void)[] = [];
+    const puffer: Record<string, unknown>[] = [];
+
+    const send = (payloadType: number, payload: Record<string, unknown>, clientMsgId: string) => {
+      ws.send(JSON.stringify({ clientMsgId, payloadType, payload }));
+    };
+    const nextMsg = (): Promise<Record<string, unknown>> => {
+      if (puffer.length) return Promise.resolve(puffer.shift()!);
+      return new Promise((res, rej) => {
+        // rej, nicht reject: das aeussere Promise wird ueber den catch in
+        // ws.onopen verworfen. Wer hier direkt reject aufruft, laesst das
+        // innere Promise fuer immer offen haengen.
+        const t = setTimeout(() => rej(new Error("Timeout im Spot-Aufbau")), 25_000);
+        warten.push((m) => { clearTimeout(t); res(m); });
+      });
+    };
+
+    ws.onopen = async () => {
+      try {
+        f.heartbeat = setInterval(() => {
+          try { ws.send(JSON.stringify({ clientMsgId: "hb", payloadType: 51, payload: {} })); }
+          catch { /* ignore */ }
+        }, 10_000);
+
+        send(PT_APP_AUTH_REQ, {
+          clientId: getEnv("CTRADER_CLIENT_ID"),
+          clientSecret: getEnv("CTRADER_CLIENT_SECRET"),
+        }, "spot_app_auth");
+        await waitFor(nextMsg, PT_APP_AUTH_RES);
+
+        send(PT_ACCOUNT_AUTH_REQ, {
+          ctidTraderAccountId: accountId,
+          accessToken: tokenRef.accessToken,
+        }, "spot_acc_auth");
+        await waitFor(nextMsg, PT_ACCOUNT_AUTH_RES);
+
+        const map = await fetchSymbolMap(send, nextMsg, accountId);
+        for (const [id, name] of map) {
+          f.namen.set(id, name);
+          f.ids.set(name.toUpperCase().replace(/[^A-Z0-9]/g, ""), id);
+        }
+        f.ready = true;
+        console.log(`[spots] ready for ${accountId}, ${f.ids.size} symbols`);
+        resolve();
+      } catch (e) {
+        f.fehler = String(e);
+        reject(e);
+      }
+    };
+
+    // Ab hier ist die Verbindung im Dauerbetrieb: Spot-Ereignisse landen im
+    // Kursspeicher, alles andere geht an den wartenden Aufbau.
+    ws.onmessage = ({ data }) => {
+      let msg: Record<string, unknown>;
+      try { msg = JSON.parse(data as string) as Record<string, unknown>; } catch { return; }
+      const pt = msg.payloadType as number;
+
+      if (pt === PT_SPOT_EVENT) {
+        const p = (msg.payload || {}) as Record<string, unknown>;
+        const id = Number(p.symbolId);
+        const name = f.namen.get(id);
+        if (!name) return;
+        const alt = f.quotes.get(name);
+        // bid und ask kommen NICHT immer beide mit — cTrader schickt nur das,
+        // was sich geaendert hat. Der jeweils andere Wert muss stehenbleiben.
+        const bidRoh = p.bid != null ? Number(p.bid) : null;
+        const askRoh = p.ask != null ? Number(p.ask) : null;
+        f.quotes.set(name, {
+          bid: bidRoh != null ? bidRoh / SPOT_SCALE : (alt ? alt.bid : 0),
+          ask: askRoh != null ? askRoh / SPOT_SCALE : (alt ? alt.ask : 0),
+          raw: bidRoh != null ? bidRoh : (askRoh ?? 0),
+          ts: Date.now(),
+        });
+        return;
+      }
+      if (pt === 2147 || pt === 2164 || pt === 51) return;   // Server-Pushs
+      if (warten.length) { warten.shift()!(msg); return; }
+      // Nach dem Aufbau wartet niemand mehr. Ohne diese Bremse sammelt der
+      // Puffer jede Abo-Bestaetigung und waechst ueber Stunden unbegrenzt.
+      if (f.ready) {
+        if (pt === PT_SUBSCRIBE_SPOTS_RES) console.log(`[spots] subscribe ok for ${f.accountId}`);
+        return;
+      }
+      puffer.push(msg);
+    };
+
+    ws.onerror = () => { f.fehler = "WebSocket-Fehler"; reject(new Error(f.fehler)); };
+    ws.onclose = (e) => {
+      console.log(`[spots] closed for ${accountId}: ${e.code}`);
+      f.ready = false;
+      if (f.heartbeat !== null) clearInterval(f.heartbeat);
+      f.heartbeat = null;
+      feeds.delete(accountId);
+    };
+  });
+
+  await abonnieren(f, symbole);
+  return f;
+}
+
+async function abonnieren(f: Feed, symbole: string[]) {
+  if (!f.ws || !f.ready) return;
+  const neu: number[] = [];
+  for (const s of symbole) {
+    const key = String(s).toUpperCase().replace(/[^A-Z0-9]/g, "");
+    const id = f.ids.get(key);
+    if (id && !f.abonniert.has(id)) { neu.push(id); f.abonniert.add(id); }
+  }
+  if (!neu.length) return;
+  f.ws.send(JSON.stringify({
+    clientMsgId: "spot_sub",
+    payloadType: PT_SUBSCRIBE_SPOTS_REQ,
+    payload: { ctidTraderAccountId: f.accountId, symbolId: neu },
+  }));
+  console.log(`[spots] subscribed ${neu.join(",")} for ${f.accountId}`);
+}
+
+// ─── LIVE-KURSE: Routen ────────────────────────────────────────
+// POST /api/spots/start  { accessToken, refreshToken, accountId, env, symbols[] }
+//      Oeffnet oder erweitert den Kursstrom. Idempotent.
+// GET  /api/spots?accountId=..&symbols=XAUUSD,EURUSD
+//      Letzte Kurse. Diese Abfrage haelt den Strom am Leben.
+async function handleSpotsStart(req: Request): Promise<Response> {
+  const body = await req.json().catch(() => ({})) as Record<string, unknown>;
+  // Beide Schreibweisen annehmen. Die App spricht die uebrigen Routen mit
+  // access_token / ctidTraderAccountId an; eine neue Route, die das anders
+  // will, ist eine Stolperfalle ohne Gegenwert.
+  const accountId    = Number(body.accountId ?? body.ctidTraderAccountId);
+  const accessToken  = String(body.accessToken  ?? body.access_token  ?? "");
+  const refreshToken = String(body.refreshToken ?? body.refresh_token ?? "");
+  const env          = String(body.env ?? body.accountEnv ?? "live");
+  const symbols = Array.isArray(body.symbols) ? (body.symbols as string[]) : [];
+  if (!accountId || !accessToken)
+    return jsonResp({ error: "accountId und accessToken sind erforderlich" }, 400);
+  try {
+    const f = await feedStarten(accountId, env, { accessToken, refreshToken }, symbols);
+    return jsonResp({
+      ok: true, accountId, bereit: f.ready,
+      symboleBekannt: f.ids.size, abonniert: [...f.abonniert].length,
+      // Nicht gefundene Namen zurueckmelden statt still zu schlucken — sonst
+      // wartet der Client ewig auf Kurse eines Symbols, das der Broker anders
+      // schreibt (XAUUSD vs GOLD vs XAU/USD).
+      nichtGefunden: symbols.filter((s) =>
+        !f.ids.get(String(s).toUpperCase().replace(/[^A-Z0-9]/g, ""))),
+    });
+  } catch (e) {
+    return jsonResp({ error: String(e) }, 502);
+  }
+}
+
+function handleSpots(url: URL): Response {
+  const accountId = Number(url.searchParams.get("accountId") || 0);
+  const f = feeds.get(accountId);
+  if (!f) return jsonResp({ error: "kein laufender Kursstrom — zuerst /api/spots/start" }, 404);
+  f.letzteAbfrage = Date.now();
+  const wunsch = (url.searchParams.get("symbols") || "").split(",")
+    .map((s) => s.trim()).filter(Boolean);
+  const out: Record<string, unknown> = {};
+  for (const [name, q] of f.quotes) {
+    if (wunsch.length && !wunsch.some((w) =>
+      w.toUpperCase().replace(/[^A-Z0-9]/g, "") === name.toUpperCase().replace(/[^A-Z0-9]/g, ""))) continue;
+    out[name] = { bid: q.bid, ask: q.ask, raw: q.raw, alterMs: Date.now() - q.ts };
+  }
+  return jsonResp({ ok: true, bereit: f.ready, kurse: out, stand: Date.now() });
 }
 
 const PORT = parseInt(getEnv("PORT") || "8000");

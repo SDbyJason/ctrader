@@ -1253,6 +1253,7 @@ async function handler(req: Request): Promise<Response> {
     if (url.pathname === "/api/deals"    && req.method === "POST") return await handleDeals(req);
     if (url.pathname === "/api/spots/start" && req.method === "POST") return await handleSpotsStart(req);
     if (url.pathname === "/api/spots"       && req.method === "GET")  return handleSpots(url);
+    if (url.pathname === "/api/candles"     && req.method === "POST") return await handleCandles(req);
     // Background sync (see the POLLER section above)
     if (url.pathname === "/api/link"        && req.method === "POST") return await handleLink(req);
     if (url.pathname === "/api/unlink"      && req.method === "POST") return await handleUnlink(req);
@@ -1290,6 +1291,8 @@ async function handler(req: Request): Promise<Response> {
 //  seiner Konto-Kennung und wird nach Leerlauf geschlossen.
 // ═══════════════════════════════════════════════════════════════════
 
+const PT_GET_TRENDBARS_REQ     = 2137; // ProtoOAGetTrendbarsReq
+const PT_GET_TRENDBARS_RES     = 2138; // ProtoOAGetTrendbarsRes
 const PT_SUBSCRIBE_SPOTS_REQ   = 2127;
 const PT_SUBSCRIBE_SPOTS_RES   = 2128;
 const PT_UNSUBSCRIBE_SPOTS_REQ = 2129;
@@ -1487,6 +1490,127 @@ async function abonnieren(f: Feed, symbole: string[]) {
 //      Oeffnet oder erweitert den Kursstrom. Idempotent.
 // GET  /api/spots?accountId=..&symbols=XAUUSD,EURUSD
 //      Letzte Kurse. Diese Abfrage haelt den Strom am Leben.
+/* ── Kerzen vom eigenen Broker ────────────────────────────────────
+   Der Fremdanbieter hat zwei harte Grenzen, die sich nicht wegprogrammieren
+   lassen: 8 Abfragen je Minute, und Indizes sind im kostenlosen Tarif
+   gesperrt. Der Broker, bei dem ohnehin gehandelt wird, kennt beide Grenzen
+   nicht und liefert genau die Instrumente, die das Konto auch handeln kann.
+
+   ProtoOATrendbar speichert die Preise SPARSAM: nur `low` ist absolut, open,
+   high und close stehen als Abstand darueber. Wer das uebersieht, bekommt
+   Kerzen im Bereich von 0.03 statt 4330 — und sucht den Fehler dann im
+   Chart statt hier. */
+const TB_PERIODE: Record<string, number> = {
+  "1min": 1, "2min": 2, "3min": 3, "4min": 4, "5min": 5, "10min": 6,
+  "15min": 7, "30min": 8, "1h": 9, "4h": 10, "12h": 11, "1day": 12,
+  "1week": 13, "1month": 14,
+};
+// Wie weit cTrader je Periode zurueck laesst (Angabe des Anbieters, in Tagen).
+const TB_SPANNE: Record<number, number> = {
+  1: 7, 2: 7, 3: 7, 4: 7, 5: 7, 6: 30, 7: 30, 8: 30,
+  9: 30, 10: 300, 11: 300, 12: 3650, 13: 3650, 14: 3650,
+};
+
+async function handleCandles(req: Request): Promise<Response> {
+  const body = await req.json().catch(() => ({})) as Record<string, unknown>;
+  const accountId    = Number(body.accountId ?? body.ctidTraderAccountId);
+  const accessToken  = String(body.accessToken  ?? body.access_token  ?? "");
+  const refreshToken = String(body.refreshToken ?? body.refresh_token ?? "");
+  const env          = String(body.env ?? body.accountEnv ?? "live");
+  const symbol       = String(body.symbol ?? "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+  const tf           = String(body.tf ?? "1min");
+  const anzahl       = Math.min(5000, Math.max(10, Number(body.count ?? 500)));
+
+  if (!accountId || !accessToken)
+    return jsonResp({ error: "accountId und accessToken sind erforderlich" }, 400);
+  const periode = TB_PERIODE[tf];
+  if (!periode) return jsonResp({ error: "unbekannter Zeitrahmen: " + tf }, 400);
+
+  const tokenRef: TokenRef = { accessToken, refreshToken };
+  let werte: Array<Record<string, number>> = [];
+  let gefunden = "";
+
+  try {
+    await withCtraderWS(async (send, nextMsg) => {
+      send(PT_APP_AUTH_REQ, {
+        clientId:     getEnv("CTRADER_CLIENT_ID"),
+        clientSecret: getEnv("CTRADER_CLIENT_SECRET"),
+      }, "app_auth");
+      await waitFor(nextMsg, PT_APP_AUTH_RES);
+
+      send(PT_ACCOUNT_AUTH_REQ, {
+        ctidTraderAccountId: accountId,
+        accessToken:         tokenRef.accessToken,
+      }, "acc_auth");
+      try {
+        await waitFor(nextMsg, PT_ACCOUNT_AUTH_RES);
+      } catch (e) {
+        const m = e instanceof Error ? e.message : String(e);
+        if (!m.includes("ACCESS_TOKEN") && !m.includes("INVALID")) throw e;
+        const neu = await refreshTokenViaWS(send, nextMsg, tokenRef.refreshToken);
+        tokenRef.accessToken = neu.accessToken;
+        send(PT_ACCOUNT_AUTH_REQ, {
+          ctidTraderAccountId: accountId,
+          accessToken:         tokenRef.accessToken,
+        }, "acc_auth_retry");
+        await waitFor(nextMsg, PT_ACCOUNT_AUTH_RES);
+      }
+
+      const namen = await fetchSymbolMap(send, nextMsg, accountId);
+      let symbolId = 0;
+      for (const [id, name] of namen) {
+        if (String(name).toUpperCase().replace(/[^A-Z0-9]/g, "") === symbol) {
+          symbolId = id; gefunden = String(name); break;
+        }
+      }
+      if (!symbolId)
+        throw new Error("Symbol " + symbol + " ist auf diesem Konto nicht handelbar");
+
+      /* Der Anbieter begrenzt die Spanne je Periode. Ein zu grosser Zeitraum
+         wird nicht gekuerzt, sondern als Fehler abgewiesen — also hier
+         zuschneiden, statt den Nutzer eine leere Antwort deuten zu lassen. */
+      const jetzt   = Date.now();
+      const maxMs   = (TB_SPANNE[periode] || 7) * 24 * 3600 * 1000;
+      const spanne  = Math.min(maxMs, anzahl * tfMillis(periode) * 3);
+      send(PT_GET_TRENDBARS_REQ, {
+        ctidTraderAccountId: accountId,
+        symbolId, period: periode,
+        fromTimestamp: jetzt - spanne,
+        toTimestamp:   jetzt,
+        count: anzahl,
+      }, "trendbars");
+
+      const res = await waitFor(nextMsg, PT_GET_TRENDBARS_RES);
+      const pl  = (res.payload || {}) as Record<string, unknown>;
+      const bars = (pl.trendbar || []) as Array<Record<string, unknown>>;
+
+      werte = bars.map((b) => {
+        const low = Number(b.low || 0);
+        return {
+          t: Number(b.utcTimestampInMinutes || 0) * 60000,
+          o: (low + Number(b.deltaOpen  || 0)) / SPOT_SCALE,
+          h: (low + Number(b.deltaHigh  || 0)) / SPOT_SCALE,
+          l: low / SPOT_SCALE,
+          c: (low + Number(b.deltaClose || 0)) / SPOT_SCALE,
+          v: Number(b.volume || 0),
+        };
+      }).filter((k) => k.t > 0).sort((a, b) => a.t - b.t);
+    }, env, tokenRef);
+
+    return jsonResp({ ok: true, symbol: gefunden, tf, anzahl: werte.length, values: werte });
+  } catch (e) {
+    return jsonResp({ error: String(e instanceof Error ? e.message : e) }, 502);
+  }
+}
+
+function tfMillis(periode: number): number {
+  const min: Record<number, number> = {
+    1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 10, 7: 15, 8: 30,
+    9: 60, 10: 240, 11: 720, 12: 1440, 13: 10080, 14: 43200,
+  };
+  return (min[periode] || 1) * 60000;
+}
+
 async function handleSpotsStart(req: Request): Promise<Response> {
   const body = await req.json().catch(() => ({})) as Record<string, unknown>;
   // Beide Schreibweisen annehmen. Die App spricht die uebrigen Routen mit
@@ -1509,6 +1633,11 @@ async function handleSpotsStart(req: Request): Promise<Response> {
       // schreibt (XAUUSD vs GOLD vs XAU/USD).
       nichtGefunden: symbols.filter((s) =>
         !f.ids.get(String(s).toUpperCase().replace(/[^A-Z0-9]/g, ""))),
+      /* Die vollstaendige Symbolliste des Kontos. Ohne sie muss man raten,
+         wie der Broker seine Instrumente schreibt — und Raten hat bei der
+         anderen Datenquelle schon einmal dazu gefuehrt, dass die Haelfte der
+         angebotenen Instrumente beim Anklicken nichts tat. */
+      symbole: [...f.namen.values()].sort(),
     });
   } catch (e) {
     return jsonResp({ error: String(e) }, 502);

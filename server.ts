@@ -1073,6 +1073,63 @@ function buildEvents(
 
 // ─── One account ────────────────────────────────────────────────
 
+/* >>> SYNC LEDGER — identical copy in every sync worker; .claude/tests/syncledger.test.js checks it.
+   What the broker actually delivered, per connection, recorded by the server
+   at the moment of delivery. The app holds its journal against this record:
+   a close the broker reported that never became a journal row is a missing
+   execution, and the broker's own P&L is the yardstick for the P&L Evidence
+   calculates. One document per connection: apexUsers/<uid>/syncHealth/<key>.
+   `days` is a JSON string because these REST helpers only write scalars.
+   Event ids are remembered per day, so a redelivered event (poll overlap,
+   replayed window) is counted as a duplicate instead of inflating the total. */
+const LEDGER_DAYS = 35, LEDGER_IDS_PER_DAY = 400;
+function ledgerKey(s: any): string { return String(s || 'unknown').replace(/[^A-Za-z0-9_.-]/g, '_').slice(0, 120); }
+function ledgerMerge(prev: any, events: any[], meta: any, now: number): Record<string, unknown> {
+  let days: any = {};
+  try { days = JSON.parse((prev && prev.days) || '{}') || {}; } catch (e) { days = {}; }
+  let received = Number((prev && prev.received) || 0);
+  let dupes = Number((prev && prev.dupes) || 0);
+  let lastEventAt = Number((prev && prev.lastEventAt) || 0);
+  for (const e of events) {
+    if (!e || e.type) continue;                       // sync_failed etc. are not trades
+    const t = Number(e.time) || now;
+    const d = new Date(t).toISOString().slice(0, 10);
+    const row = days[d] || (days[d] = { e: 0, c: 0, p: 0, pn: 0, ids: [] });
+    const id = e.posId && e.event !== 'modify' ? String(e.event || 'open') + ':' + String(e.posId) : '';
+    if (id && row.ids.indexOf(id) >= 0) { dupes++; continue; }
+    if (id && row.ids.length < LEDGER_IDS_PER_DAY) row.ids.push(id);
+    /* A realisation is a close, or a fill that carries realised P&L
+       (Binance/Bybit futures, IBKR) — an opening fill carries none or 0. */
+    const p = Number(e.pnl);
+    const hasPnl = e.pnl != null && e.pnl !== '' && Number.isFinite(p);
+    if (e.event === 'close' || (e.event === 'fill' && hasPnl && p !== 0)) {
+      row.c++;
+      if (hasPnl) { row.p = Math.round((row.p + p) * 100) / 100; row.pn++; }
+    }
+    row.e++;
+    received++;
+    if (t > lastEventAt) lastEventAt = t;
+  }
+  const cutoff = new Date(now - LEDGER_DAYS * 86400000).toISOString().slice(0, 10);
+  Object.keys(days).forEach((d) => { if (d < cutoff) delete days[d]; });
+  return {
+    source: String(meta.source || ''), account: String(meta.account || ''),
+    label: String(meta.label || ''), received, dupes, lastEventAt,
+    days: JSON.stringify(days), updatedAt: now,
+  };
+}
+/* <<< SYNC LEDGER */
+
+async function recordLedger(uid: string, key: string, meta: Record<string, unknown>,
+                            events: Array<Record<string, unknown>>): Promise<void> {
+  if (!events.length) return;
+  try {
+    const path = `apexUsers/${uid}/syncHealth/${ledgerKey(key)}`;
+    const prev = await fsGet(path);
+    await fsSet(path, ledgerMerge(prev, events, meta, Date.now()));
+  } catch (e) { console.error("[ledger]", e); }   // never fails the sync itself
+}
+
 async function pollLink(link: Record<string, unknown>): Promise<number> {
   const uid       = String(link.uid);
   const accountId = Number(link.accountId);
@@ -1132,6 +1189,9 @@ async function pollLink(link: Record<string, unknown>): Promise<number> {
 
   const { events, known, maxTs } = buildEvents(deals, openPositions, link.knownOpen, from);
   for (const ev of events) await emitEvent(uid, ev);
+  await recordLedger(uid, `ctrader_${accountId}`,
+    { source: "ctrader", account: String(accountId),
+      label: String(link.accountLabel || accountId) }, events);
 
   await fsSet(path, {
     refreshTokenEnc: await encryptToken(tokenRef.refreshToken),   // cTrader rotates it
